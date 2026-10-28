@@ -15,6 +15,8 @@ import {
   getWorkspaceInterpreter,
   InterpreterRegistration
 } from "../../utils/pythonEnv.js";
+import { getJupyterApi } from "../../utils/jupyter.js";
+import { resetSession } from "../../utils/staleness.js";
 import { READ_ONLY, EDITS, DESTRUCTIVE } from "./annotations.js";
 
 const TextResult = (text: string) =>
@@ -23,21 +25,6 @@ const TextResult = (text: string) =>
 const ErrorResult = (text: string) =>
   ({ content: [{ type: "text" as const, text }], isError: true });
 
-const JUPYTER_EXTENSION_ID = "ms-toolsai.jupyter";
-
-let jupyterApi: any | undefined;
-
-async function getJupyterApi(): Promise<any> {
-  if (jupyterApi) return jupyterApi;
-  const ext = vscode.extensions.getExtension(JUPYTER_EXTENSION_ID);
-  if (!ext) {
-    throw new Error(
-      `Jupyter extension (${JUPYTER_EXTENSION_ID}) is not installed.`
-    );
-  }
-  jupyterApi = await ext.activate();
-  return jupyterApi;
-}
 
 /**
  * Wait for an in-flight kernel restart to finish.
@@ -93,6 +80,8 @@ function waitForKernelRestart(
         started = true;
         clearTimeout(graceTimer);
       } else if (s === "dead") {
+        // The old process is killed as part of a restart; the caller looks
+        // the kernel up again afterwards to see whether a new one came up.
         finish(s);
       } else if (s === "idle" && started) {
         finish(s);
@@ -379,19 +368,30 @@ export function registerKernelTools(server: McpServer): void {
         });
         finalStatus = await restartDone;
         forgetRuns(notebook);
+        resetSession(notebook);
       } catch (err) {
         return ErrorResult(
           `Error: ${err instanceof Error ? err.message : String(err)}`
         );
       }
 
+      // A restart briefly reports "dead" (the old process is killed first, and
+      // on Windows the new session can be a different kernel object), so look
+      // up the notebook's kernel again until it has settled.
       let confirmed: any;
-      try {
-        const api = await getJupyterApi();
-        confirmed = await api?.kernels?.getKernel?.(notebook.uri);
-      } catch {
-        // best-effort confirmation only
-      }
+      const settleBy = Date.now() + 30_000;
+      do {
+        try {
+          const api = await getJupyterApi();
+          confirmed = await api?.kernels?.getKernel?.(notebook.uri);
+        } catch {
+          // best-effort confirmation only
+        }
+        if (confirmed && confirmed.status !== "dead" && confirmed.status !== "restarting" && confirmed.status !== "starting") {
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 500));
+      } while (Date.now() < settleBy);
 
       const result = {
         notebookUri: notebook.uri.toString(),

@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-10-28
+
+### Added
+
+- `notebook_status` — whether the kernel matches the code on screen: code cells edited since they ran, cells not run in this kernel (outputs from disk, or before a restart), fresh cells that ran after one of those, running cells, unsaved changes. `notebook_list_cells` reports the same `state` per cell. Restarts are noticed whether they come from the tool or the editor.
+- `notebook_run_cells` — run a range, everything from the first stale cell on (`mode: "stale"`), or all code cells, in order, stopping at the first error by default, with one summary and outputs only for the failing and last cells.
+- `notebook_inspect_variables` — list kernel variables (type, shape/len, dtype, DataFrame columns) or describe named ones with a preview, through the Jupyter kernel API: no cell is added and the execution count doesn't change.
+- Cells the agent changed or inserted show "Changed by agent" / "Inserted by agent" in their cell status bar until the user edits or runs them.
+- Setting `notebook-mcp.confirmEdits` (off by default): before each insert, edit or delete, open a diff and ask to apply or reject; no answer within 2 minutes rejects.
+- A stdio bridge (`~/.vscode-notebook-mcp/bridge.js`, kept up to date by the extension) that connects an MCP client to the VS Code window whose workspace contains the client's working directory, reads the token from the discovery file, and reconnects when the window restarts or its session expires. **Notebook MCP: Add to Claude Code** registers it (`claude mcp add --scope user notebook -- node …/bridge.js`); no token ends up in Claude Code's config.
+
+### Changed
+
+- **Copy Claude Code Command** now copies the bridge command instead of an HTTP command with the token.
+- Idle MCP sessions are closed after 2 hours (and the oldest beyond 32); a request for an unknown session gets a 404 so clients start a new one.
+- `notebook_restart_kernel` waits for the kernel to settle and no longer reports `dead` right after a successful restart.
+
 ## [0.5.0] - 2026-10-28
 
 ### Added

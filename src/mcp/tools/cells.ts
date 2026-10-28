@@ -27,38 +27,27 @@ import {
   forgetRuns,
   findReplaceRanges,
   applyCellTextEdits,
+  textAfter,
   CellTextEdit,
   saveNotebook
 } from "../../utils/notebook.js";
 import { READ_ONLY, EDITS, DESTRUCTIVE, RUNS_CODE } from "./annotations.js";
-
-type ContentBlock =
-  | { type: "text"; text: string }
-  | { type: "image"; data: string; mimeType: string };
-
-const TextResult = (text: string) =>
-  ({ content: [{ type: "text" as const, text }] });
-
-const ErrorResult = (text: string) =>
-  ({ content: [{ type: "text" as const, text }], isError: true });
-
-function ResultWithImages(text: string, outputs: CellOutput[]) {
-  const content: ContentBlock[] = [{ type: "text", text }];
-  for (const o of outputs) {
-    if (o.type === "image") {
-      content.push({ type: "image", data: o.data, mimeType: o.mimeType });
-    }
-  }
-  return { content };
-}
-
-const kindOf = (cell: vscode.NotebookCell) =>
-  cell.kind === vscode.NotebookCellKind.Code ? "code" : "markdown";
-
-const budgetOf = (args: { max_output_chars: number; max_images: number }): OutputBudget => ({
-  maxChars: args.max_output_chars,
-  maxImages: args.max_images
-});
+import {
+  TextResult,
+  ErrorResult,
+  ResultWithImages,
+  kindOf,
+  budgetOf,
+  runAndDescribe,
+  RunDescription,
+  describeRunMarkdown
+} from "./common.js";
+import { notebookRunStates } from "../../utils/staleness.js";
+import {
+  confirmChanges,
+  markAgentEdits,
+  REJECTED_MESSAGE
+} from "../../utils/agentEdits.js";
 
 const ListCellsInput = {
   notebook_uri: NotebookUriSchema,
@@ -157,55 +146,32 @@ const NotebookOnlyInput = {
   response_format: ResponseFormatSchema
 };
 
+/**
+ * A cell's text after all of a batch's edits to it. Replace ranges all refer
+ * to the original text and don't overlap, so apply them from the end.
+ */
+function textAfterAll(cell: vscode.NotebookCell, edits: CellTextEdit[]): string {
+  const whole = edits.find((e) => e.kind === "set");
+  if (whole && whole.kind === "set") return whole.content;
+  const doc = cell.document;
+  const spans = edits
+    .flatMap((e) =>
+      e.kind === "replace"
+        ? e.ranges.map((r) => [doc.offsetAt(r.start), doc.offsetAt(r.end), e.new_string] as const)
+        : []
+    )
+    .sort((a, b) => b[0] - a[0]);
+  let text = doc.getText();
+  for (const [start, end, replacement] of spans) {
+    text = text.slice(0, start) + replacement + text.slice(end);
+  }
+  return text;
+}
+
 /** Lines (1-based) touched by a set of ranges, for confirmation messages. */
 function touchedLines(ranges: vscode.Range[]): string {
   const lines = [...new Set(ranges.map((r) => r.start.line + 1))].sort((a, b) => a - b);
   return lines.length === 1 ? `line ${lines[0]}` : `lines ${lines.join(", ")}`;
-}
-
-/**
- * Run (or wait for) a cell and build the tool result. Shared by run, wait and
- * insert-with-execute so they report the same shape.
- */
-async function runAndDescribe(
-  notebook: vscode.NotebookDocument,
-  cell: vscode.NotebookCell,
-  opts: { execute: boolean; timeoutSeconds: number; budget: OutputBudget }
-) {
-  const { finished } = await runCellAndWait(notebook, cell, {
-    execute: opts.execute,
-    timeoutMs: opts.timeoutSeconds * 1000
-  });
-  const summary = cell.executionSummary;
-  return {
-    cellId: cellIdOf(cell),
-    cellIndex: cell.index,
-    status: finished ? ("finished" as const) : ("running" as const),
-    success: finished ? (summary?.success ?? false) : null,
-    executionOrder: summary?.executionOrder ?? null,
-    outputs: await parseOutputs(cell.outputs, opts.budget)
-  };
-}
-
-type RunDescription = Awaited<ReturnType<typeof runAndDescribe>>;
-
-function describeRunMarkdown(r: RunDescription, timeoutSeconds: number): string[] {
-  const lines: string[] = [];
-  if (r.status === "running") {
-    lines.push(
-      `**Status**: Still running after ${timeoutSeconds} s (cell id \`${r.cellId}\`). Outputs so far are below. Call notebook_wait_cell to keep waiting, or notebook_interrupt_kernel to stop it.`
-    );
-  } else {
-    lines.push(
-      `**Status**: ${r.success ? "Success" : "Failed"}${r.executionOrder ? ` (execution #${r.executionOrder})` : ""}`
-    );
-  }
-  if (r.outputs.length > 0) {
-    lines.push("", "## Output", formatOutputsAsMarkdown(r.outputs));
-  } else {
-    lines.push("", "No output.");
-  }
-  return lines;
 }
 
 export function registerCellTools(server: McpServer): void {
@@ -218,9 +184,10 @@ export function registerCellTools(server: McpServer): void {
       const access = await resolveNotebook(notebook_uri);
       if (!access.allowed) return ErrorResult(`Error: ${access.error}`);
 
-      const cells = access.notebook!.getCells().map((cell, index) => ({
+      const { states } = notebookRunStates(access.notebook!, isCellExecuting);
+      const cells = states.map(({ cell, state, afterStale }) => ({
         id: cellIdOf(cell),
-        index,
+        index: cell.index,
         kind: kindOf(cell),
         language: cell.document.languageId,
         lineCount: cell.document.lineCount,
@@ -230,7 +197,9 @@ export function registerCellTools(server: McpServer): void {
           .replace(/\n/g, "↵"),
         hasOutput: cell.outputs.length > 0,
         executionOrder: cell.executionSummary?.executionOrder ?? null,
-        running: isCellExecuting(cell)
+        running: state === "running",
+        state,
+        afterStale
       }));
 
       if (response_format === "json") {
@@ -241,8 +210,16 @@ export function registerCellTools(server: McpServer): void {
       for (const cell of cells) {
         const exec = cell.running ? " [*]" : cell.executionOrder ? ` [${cell.executionOrder}]` : "";
         const out = cell.hasOutput ? " 📊" : "";
+        const note =
+          cell.state === "edited"
+            ? " — edited since it ran"
+            : cell.state === "not-run"
+              ? " — not run in this kernel"
+              : cell.afterStale
+                ? " — ran after a stale cell"
+                : "";
         lines.push(
-          `## Cell ${cell.index}${exec}${out} (${cell.kind}/${cell.language}) id: \`${cell.id}\``
+          `## Cell ${cell.index}${exec}${out} (${cell.kind}/${cell.language}) id: \`${cell.id}\`${note}`
         );
         lines.push(...fenced(cell.preview + (cell.lineCount > 3 ? "..." : "")), "");
       }
@@ -347,10 +324,17 @@ export function registerCellTools(server: McpServer): void {
 
       const insertIndex =
         index !== undefined ? Math.min(index, notebook.cellCount) : notebook.cellCount;
+      const approved = await confirmChanges(
+        notebook,
+        `insert a ${type} cell${execute && type === "code" ? " and run it" : ""}`,
+        [{ label: `New ${type} cell at ${insertIndex}`, before: "", after: content }]
+      );
+      if (!approved) return ErrorResult(REJECTED_MESSAGE);
       await insertCells(notebook.uri, insertIndex, [cellData]);
 
       const inserted = notebook.getCells().find((c) => c.metadata?.id === cellId);
       if (!inserted) return ErrorResult("Error: failed to locate inserted cell.");
+      markAgentEdits([inserted], "inserted");
 
       const cellIndex = inserted.index;
 
@@ -426,9 +410,14 @@ export function registerCellTools(server: McpServer): void {
       if (!found.cell) return ErrorResult(`Error: ${found.error}`);
 
       const cell = found.cell;
+      const approved = await confirmChanges(access.notebook!, `replace cell ${cell.index}`, [
+        { label: `Cell ${cell.index}`, before: cell.document.getText(), after: content }
+      ]);
+      if (!approved) return ErrorResult(REJECTED_MESSAGE);
       if (!(await applyCellTextEdits([{ cell, kind: "set", content }]))) {
         return ErrorResult("Error: VS Code rejected the edit.");
       }
+      markAgentEdits([cell], "changed");
 
       if (response_format === "json") {
         return TextResult(
@@ -455,9 +444,15 @@ export function registerCellTools(server: McpServer): void {
       if (!match.ranges) return ErrorResult(`Error: ${match.error}`);
 
       const where = touchedLines(match.ranges);
-      if (!(await applyCellTextEdits([{ cell, kind: "replace", ranges: match.ranges, new_string }]))) {
+      const edit: CellTextEdit = { cell, kind: "replace", ranges: match.ranges, new_string };
+      const approved = await confirmChanges(access.notebook!, `edit cell ${cell.index} at ${where}`, [
+        { label: `Cell ${cell.index}`, before: cell.document.getText(), after: textAfter(edit) }
+      ]);
+      if (!approved) return ErrorResult(REJECTED_MESSAGE);
+      if (!(await applyCellTextEdits([edit]))) {
         return ErrorResult("Error: VS Code rejected the edit.");
       }
+      markAgentEdits([cell], "changed");
 
       const result = {
         id: cellIdOf(cell),
@@ -539,9 +534,23 @@ export function registerCellTools(server: McpServer): void {
       if (problems.length > 0) {
         return ErrorResult(`Error: no edits were applied.\n- ${problems.join("\n- ")}`);
       }
+      // One preview per cell, with all of that cell's edits applied.
+      const byCell = new Map<vscode.NotebookCell, CellTextEdit[]>();
+      for (const p of planned) byCell.set(p.cell, [...(byCell.get(p.cell) ?? []), p]);
+      const approved = await confirmChanges(
+        notebook,
+        `apply ${planned.length} edit${planned.length === 1 ? "" : "s"} to ${byCell.size} cell${byCell.size === 1 ? "" : "s"}`,
+        [...byCell].map(([cell, cellEdits]) => ({
+          label: `Cell ${cell.index}`,
+          before: cell.document.getText(),
+          after: textAfterAll(cell, cellEdits)
+        }))
+      );
+      if (!approved) return ErrorResult(REJECTED_MESSAGE);
       if (!(await applyCellTextEdits(planned))) {
         return ErrorResult("Error: VS Code rejected the edits; nothing was changed.");
       }
+      markAgentEdits([...byCell.keys()], "changed");
 
       const cells = [...new Set(planned.map((p) => p.cell))].map((c) => ({
         id: cellIdOf(c),
@@ -569,6 +578,10 @@ export function registerCellTools(server: McpServer): void {
       if (!found.cell) return ErrorResult(`Error: ${found.error}`);
 
       const deletedIndex = found.cell.index;
+      const approved = await confirmChanges(notebook, `delete cell ${deletedIndex}`, [
+        { label: `Cell ${deletedIndex} (deleted)`, before: found.cell.document.getText(), after: "" }
+      ]);
+      if (!approved) return ErrorResult(REJECTED_MESSAGE);
       await deleteCells(notebook.uri, deletedIndex, 1);
 
       if (response_format === "json") {

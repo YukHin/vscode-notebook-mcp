@@ -1,3 +1,4 @@
+import { execFile } from "child_process";
 import * as crypto from "crypto";
 import * as fs from "fs";
 import * as os from "os";
@@ -6,6 +7,7 @@ import * as vscode from "vscode";
 import { startMCPServer, ServerHandle } from "./mcp/server.js";
 import { initPlotlyRenderer } from "./utils/plotly.js";
 import { watchCellExecution } from "./utils/notebook.js";
+import { registerAgentEditMarkers } from "./utils/agentEdits.js";
 
 const TOKEN_SECRET_KEY = "notebook-mcp.token";
 // One JSON file per running window, so local clients can find the port and
@@ -22,6 +24,7 @@ let token: string | undefined;
 export async function activate(context: vscode.ExtensionContext) {
   extensionContext = context;
   watchCellExecution(context);
+  registerAgentEditMarkers(context);
   initPlotlyRenderer(context);
   statusBarItem = vscode.window.createStatusBarItem(
     vscode.StatusBarAlignment.Right,
@@ -39,19 +42,21 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand("notebook-mcp.copyClaudeCommand", () =>
       copyClaudeCommand()
     ),
+    vscode.commands.registerCommand("notebook-mcp.addToClaudeCode", () =>
+      addToClaudeCode()
+    ),
     vscode.commands.registerCommand("notebook-mcp.regenerateToken", async () => {
       token = crypto.randomBytes(32).toString("base64url");
       await context.secrets.store(TOKEN_SECRET_KEY, token);
       await stopServer();
       await startServer();
-      const choice = await vscode.window.showWarningMessage(
-        "Notebook MCP: token regenerated. Clients using the old token must be reconfigured.",
-        "Copy Claude Code Command"
+      vscode.window.showWarningMessage(
+        "Notebook MCP: token regenerated. Clients connected through the bridge pick it up automatically; HTTP clients configured with the old token must be updated."
       );
-      if (choice) await copyClaudeCommand();
     })
   );
 
+  installBridge(context);
   await startServer();
 }
 
@@ -152,21 +157,89 @@ function removeStaleDiscoveryFiles() {
   }
 }
 
-function claudeCommand(port: number, secret: string): string {
-  return `claude mcp add --transport http --scope user notebook http://127.0.0.1:${port}/mcp --header "Authorization: Bearer ${secret}"`;
+const BRIDGE_PATH = path.join(DISCOVERY_DIR, "bridge.js");
+
+/**
+ * Keep a copy of the stdio bridge at a fixed path, so MCP client configs
+ * don't break when the extension updates (its install folder includes the
+ * version).
+ */
+function installBridge(context: vscode.ExtensionContext) {
+  try {
+    const source = path.join(context.extensionPath, "dist", "bridge.js");
+    const code = fs.readFileSync(source);
+    fs.mkdirSync(DISCOVERY_DIR, { recursive: true, mode: 0o700 });
+    let current: Buffer | undefined;
+    try {
+      current = fs.readFileSync(BRIDGE_PATH);
+    } catch {
+      // not installed yet
+    }
+    if (!current || !current.equals(code)) {
+      fs.writeFileSync(BRIDGE_PATH, code);
+    }
+  } catch (err) {
+    console.error("Notebook MCP: could not install the bridge:", err);
+  }
+}
+
+/** Args for `claude mcp add` that register the bridge for all projects. */
+function claudeAddArgs(): string[] {
+  return ["mcp", "add", "--scope", "user", "notebook", "--", "node", BRIDGE_PATH];
+}
+
+function claudeCommand(): string {
+  return `claude ${claudeAddArgs().map((a) => (/\s/.test(a) ? `"${a}"` : a)).join(" ")}`;
 }
 
 async function copyClaudeCommand() {
-  if (!serverHandle) {
-    vscode.window.showErrorMessage("Notebook MCP is not running.");
+  await vscode.env.clipboard.writeText(claudeCommand());
+  vscode.window.showInformationMessage(
+    "Notebook MCP: Claude Code command copied. Run it once in a terminal; Claude Code then reaches the VS Code window for whatever folder it runs in."
+  );
+}
+
+function runClaude(args: string[]): Promise<{ ok: boolean; output: string }> {
+  return new Promise((resolve) => {
+    // shell: claude is a .cmd/.ps1 shim on some Windows installs.
+    execFile("claude", args, { shell: process.platform === "win32", timeout: 60_000 }, (err, stdout, stderr) => {
+      resolve({ ok: !err, output: `${stdout}${stderr}`.trim() || (err ? String(err.message) : "") });
+    });
+  });
+}
+
+/**
+ * Register the bridge with Claude Code (user scope), replacing an existing
+ * "notebook" server after asking.
+ */
+async function addToClaudeCode() {
+  const choice = await vscode.window.showInformationMessage(
+    "Add Notebook MCP to Claude Code for all your projects? This replaces any existing Claude Code MCP server named \"notebook\". Claude Code will then reach the VS Code window for the folder it runs in; no token is stored in its config.",
+    { modal: true },
+    "Add"
+  );
+  if (choice !== "Add") return;
+
+  const probe = await runClaude(["--version"]);
+  if (!probe.ok) {
+    await vscode.env.clipboard.writeText(claudeCommand());
+    vscode.window.showWarningMessage(
+      "Notebook MCP: couldn't run the claude command from VS Code. The setup command is on your clipboard; run it in a terminal where claude works."
+    );
     return;
   }
-  await vscode.env.clipboard.writeText(
-    claudeCommand(serverHandle.port, await getToken())
-  );
-  vscode.window.showInformationMessage(
-    "Notebook MCP: Claude Code command copied. Paste it into a terminal and run it once. It contains your access token, so don't share it."
-  );
+  await runClaude(["mcp", "remove", "--scope", "user", "notebook"]);
+  const added = await runClaude(claudeAddArgs());
+  if (added.ok) {
+    vscode.window.showInformationMessage(
+      "Notebook MCP: added to Claude Code. Start a new Claude Code session to use it."
+    );
+  } else {
+    await vscode.env.clipboard.writeText(claudeCommand());
+    vscode.window.showErrorMessage(
+      `Notebook MCP: claude mcp add failed (${added.output.slice(0, 200)}). The command is on your clipboard to run yourself.`
+    );
+  }
 }
 
 function updateStatusBar() {
@@ -190,12 +263,12 @@ async function showInfo() {
     const url = `http://127.0.0.1:${serverHandle.port}/mcp`;
     const choice = await vscode.window.showInformationMessage(
       `Notebook MCP running at ${url}`,
-      "Copy Claude Code Command",
+      "Add to Claude Code",
       "Copy URL",
       "Restart"
     );
-    if (choice === "Copy Claude Code Command") {
-      await copyClaudeCommand();
+    if (choice === "Add to Claude Code") {
+      await addToClaudeCode();
     } else if (choice === "Copy URL") {
       await vscode.env.clipboard.writeText(url);
     } else if (choice === "Restart") {

@@ -2,16 +2,21 @@
 
 A VS Code extension that exposes the Jupyter notebooks in your VSCode editor to MCP-compatible AI agents (e.g. Claude Code). The agent reads, edits, and runs cells against the same kernel VS Code is using.
 
-> Status: pre-alpha, single-developer project. Built fresh; not a fork.
+> **This is a fork.** It is based on [caryan/vscode-notebook-mcp](https://github.com/caryan/vscode-notebook-mcp) by Colm Ryan (MIT), forked at v0.3.0 (commit `9e8061a`). The original license and copyright are kept in [LICENSE](LICENSE).
+>
+> **How the fork was made.** The changes from 0.4.0 on — token authentication and DNS-rebinding protection, reliable execution tracking, Windows support, partial edits, stable cell ids, long-run handling, output budgets, stale-cell tracking, variable inspection, agent-edit markers and the stdio bridge — were designed, implemented and tested mainly by [Claude Code](https://claude.com/claude-code) (Anthropic's coding agent, model Claude Opus 5.5), working from a code review it wrote of the original project and directed and reviewed by YukHin. See [CHANGELOG.md](CHANGELOG.md) for the full list and the commit history for details.
+>
+> Status: pre-alpha.
 
-## Tools (19)
+## Tools (22)
 
 ### Discovery
 | Tool | Description |
 |---|---|
 | `notebook_list_open` | List all open notebooks with URI, file name, cell count, and which is active |
 | `notebook_open` | Open a `.ipynb` file (absolute path, `file://` URI, or workspace-relative) so its cells become available |
-| `notebook_list_cells` | List cells with stable id, index, kind, language, preview, execution state |
+| `notebook_list_cells` | List cells with stable id, index, kind, language, preview, execution state, and run state (fresh / edited since run / not run in this kernel) |
+| `notebook_status` | Does the kernel match the code on screen? Edited, not-run and downstream cells, running cells, unsaved changes |
 | `notebook_get_cell_content` | Full source of a cell |
 | `notebook_get_cell_output` | Current outputs of a cell (text, errors, images), within an output budget |
 
@@ -29,7 +34,9 @@ A VS Code extension that exposes the Jupyter notebooks in your VSCode editor to 
 | Tool | Description |
 |---|---|
 | `notebook_run_cell` | Execute a code cell and return this run's outputs; long runs report `running` after `timeout_seconds` |
+| `notebook_run_cells` | Run a range, everything from the first stale cell on (`mode: "stale"`), or all; stops at the first error; one summary |
 | `notebook_wait_cell` | Wait for a running cell without starting it again |
+| `notebook_inspect_variables` | Kernel variables with type / shape / dtype / columns, or previews of named ones — no cell added, execution count unchanged |
 | `notebook_interrupt_kernel` | Stop running and queued cells, keeping kernel state |
 | `notebook_clear_cell_output` | Clear outputs of one cell |
 | `notebook_clear_all_outputs` | Clear outputs of every cell |
@@ -52,11 +59,13 @@ All tools accept an optional `notebook_uri` (omitted → uses the active noteboo
    npm run build
    ```
    Then open this folder in VS Code and press **F5** to launch an Extension Development Host with the extension loaded.
-3. Connect your MCP client. The server requires a bearer token, generated on first run. For Claude Code, run **Notebook MCP: Copy Claude Code Command** from the command palette and paste the copied line into a terminal; it looks like:
+3. Connect your MCP client. For Claude Code, run **Notebook MCP: Add to Claude Code** from the command palette (or **Copy Claude Code Command** and run it yourself). It registers the bundled stdio bridge for all your projects:
    ```bash
-   claude mcp add --transport http --scope user notebook http://127.0.0.1:49777/mcp --header "Authorization: Bearer <token>"
+   claude mcp add --scope user notebook -- node ~/.vscode-notebook-mcp/bridge.js
    ```
-   For other clients, the URL and token are also in `~/.vscode-notebook-mcp/<pid>.json` (one file per VS Code window). To keep the token out of a checked-in `.mcp.json`, reference an environment variable: `"headers": { "Authorization": "Bearer ${NOTEBOOK_MCP_TOKEN}" }`.
+   The bridge connects Claude Code to the VS Code window whose workspace contains the folder Claude Code runs in (override with `NOTEBOOK_MCP_WORKSPACE`), so several windows each get the right notebooks. It reads the port and token from `~/.vscode-notebook-mcp/<pid>.json`, so no token is stored in Claude Code's config, and it reconnects if the window restarts. Requires `node` on PATH.
+
+   Other clients can talk HTTP directly: the URL and bearer token are in `~/.vscode-notebook-mcp/<pid>.json` (one file per window). To keep the token out of a checked-in `.mcp.json`, reference an environment variable: `"headers": { "Authorization": "Bearer ${NOTEBOOK_MCP_TOKEN}" }`.
 4. Open a `.ipynb` file in the Extension Development Host. Look for the `🪐 :49777` indicator in the status bar.
 
 ### Security
@@ -68,9 +77,15 @@ The server listens on `127.0.0.1` only, rejects requests whose `Host` isn't `127
 | Setting | Default | Description |
 |---|---|---|
 | `notebook-mcp.port` | `49777` | Preferred port. Auto-increments if busy (up to +99). |
+| `notebook-mcp.confirmEdits` | `false` | Review each agent change first: a diff opens and a notification asks to apply or reject (no answer in 2 minutes rejects). |
+
+Cells the agent changed or inserted show **Changed by agent** / **Inserted by agent** in their cell status bar until you edit or run them; undo with Ctrl+Z (Cmd+Z).
 
 ### Commands
 
+- `Notebook MCP: Add to Claude Code`
+- `Notebook MCP: Copy Claude Code Command`
+- `Notebook MCP: Regenerate Access Token`
 - `Notebook MCP: Restart Server`
 - `Notebook MCP: Show Server Info`
 
@@ -208,8 +223,8 @@ Other projects along similar lines to this project:
 - [datalayer/jupyter-mcp-server](https://github.com/datalayer/jupyter-mcp-server) — MCP server that talks to a running Jupyter server via HTTP/WebSocket.
 - [olavocarvalho/vscode-runtime-notebook-mcp](https://github.com/olavocarvalho/vscode-runtime-notebook-mcp) — similar architecture as this project (VS Code Notebook API + embedded HTTP MCP server).
 
-I built this fresh to learn and so I have room to tweak the design and develop new features such as reading Plotly images. 
+The original author built the upstream project fresh, to learn and to have room to tweak the design and develop new features such as reading Plotly images; this fork builds on that work.
 
 ## License
 
-MIT
+MIT. Copyright (c) 2026 Colm Ryan for the original project; the fork's changes are released under the same license.

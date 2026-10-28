@@ -1,5 +1,6 @@
 import * as crypto from "crypto";
 import * as vscode from "vscode";
+import { recordRunStart } from "./staleness.js";
 
 export interface NotebookAccessResult {
   allowed: boolean;
@@ -186,6 +187,20 @@ export type CellTextEdit =
   | { cell: vscode.NotebookCell; kind: "set"; content: string }
   | { cell: vscode.NotebookCell; kind: "replace"; ranges: vscode.Range[]; new_string: string };
 
+/** The cell's text as it would be after `edit`, for previews. */
+export function textAfter(edit: CellTextEdit): string {
+  if (edit.kind === "set") return edit.content;
+  const doc = edit.cell.document;
+  let text = doc.getText();
+  const spans = edit.ranges
+    .map((r) => [doc.offsetAt(r.start), doc.offsetAt(r.end)] as const)
+    .sort((a, b) => b[0] - a[0]);
+  for (const [start, end] of spans) {
+    text = text.slice(0, start) + edit.new_string + text.slice(end);
+  }
+  return text;
+}
+
 /**
  * Apply text edits to one or more cells in a single WorkspaceEdit, so they
  * land together. Callers validate every edit first; this only applies.
@@ -222,6 +237,9 @@ export function watchCellExecution(context: vscode.ExtensionContext): void {
         const summary = change.executionSummary;
         if (!summary) continue;
         if (typeof summary.success === "boolean") {
+          // A very short run can arrive as a single "finished" change with
+          // no "started" one before it; it still ran.
+          if (!runningCells.has(change.cell)) recordRunStart(change.cell);
           runningCells.delete(change.cell);
         } else if (
           summary.executionOrder !== undefined ||
@@ -230,6 +248,7 @@ export function watchCellExecution(context: vscode.ExtensionContext): void {
           // Only a run that has actually started: inserting or editing a cell
           // can also report an empty summary, and treating that as running
           // would make the tools wait on a run that never happens.
+          if (!runningCells.has(change.cell)) recordRunStart(change.cell);
           runningCells.add(change.cell);
         }
       }

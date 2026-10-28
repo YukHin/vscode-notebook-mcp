@@ -5,6 +5,9 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { registerAllTools } from "./tools/index.js";
 
 const PORT_SCAN_RANGE = 100;
+const SESSION_IDLE_MS = 2 * 60 * 60 * 1000;
+const SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+const MAX_SESSIONS = 32;
 
 export interface ServerHandle {
   port: number;
@@ -56,7 +59,7 @@ function rejectUnauthorized(
     res.end(
       JSON.stringify({
         error:
-          "Missing or invalid token. Run 'Notebook MCP: Copy Claude Code Command' in VS Code."
+          "Missing or invalid token. Connect through the bridge ('Notebook MCP: Add to Claude Code' in VS Code), or read the token from ~/.vscode-notebook-mcp/<pid>.json."
       })
     );
     return true;
@@ -81,6 +84,30 @@ export async function startMCPServer(
 
   const transports = new Map<string, StreamableHTTPServerTransport>();
   const servers = new Map<string, McpServer>();
+  const lastSeen = new Map<string, number>();
+
+  // Clients that crash or lose the connection never send DELETE, so their
+  // sessions would pile up for as long as VS Code runs. Close sessions idle
+  // for SESSION_IDLE_MS, and the least recently used beyond MAX_SESSIONS.
+  // A client that comes back gets a 404 and, per the MCP spec, starts a new
+  // session.
+  const closeSession = (id: string) => {
+    transports.get(id)?.close();
+    transports.delete(id);
+    servers.delete(id);
+    lastSeen.delete(id);
+  };
+  const sweep = setInterval(() => {
+    const now = Date.now();
+    for (const [id, seen] of lastSeen) {
+      if (now - seen > SESSION_IDLE_MS) closeSession(id);
+    }
+  }, SWEEP_INTERVAL_MS);
+  const enforceCap = () => {
+    if (lastSeen.size <= MAX_SESSIONS) return;
+    const oldest = [...lastSeen].sort((a, b) => a[1] - b[1]);
+    for (const [id] of oldest.slice(0, lastSeen.size - MAX_SESSIONS)) closeSession(id);
+  };
 
   const createMcpServer = (): McpServer => {
     const mcp = new McpServer(
@@ -109,7 +136,13 @@ export async function startMCPServer(
       const sessionId = req.headers["mcp-session-id"] as string | undefined;
       try {
         if (sessionId && transports.has(sessionId)) {
+          lastSeen.set(sessionId, Date.now());
           await transports.get(sessionId)!.handleRequest(req, res);
+          return;
+        }
+        if (sessionId) {
+          res.writeHead(404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Session expired or unknown; start a new session." }));
           return;
         }
         if (req.method === "POST") {
@@ -121,9 +154,12 @@ export async function startMCPServer(
           const mcp = createMcpServer();
           transports.set(newSessionId, transport);
           servers.set(newSessionId, mcp);
+          lastSeen.set(newSessionId, Date.now());
+          enforceCap();
           transport.onclose = () => {
             transports.delete(newSessionId);
             servers.delete(newSessionId);
+            lastSeen.delete(newSessionId);
           };
           await mcp.connect(transport);
           await transport.handleRequest(req, res);
@@ -159,11 +195,13 @@ export async function startMCPServer(
     port,
     stop: () =>
       new Promise<void>((resolve) => {
+        clearInterval(sweep);
         for (const t of transports.values()) {
           t.close();
         }
         transports.clear();
         servers.clear();
+        lastSeen.clear();
         httpServer.close(() => resolve());
       })
   };

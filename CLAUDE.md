@@ -20,6 +20,9 @@ To run the extension: open this folder in VS Code and press **F5** to launch an 
 
 `npm test` requires `uv` on PATH — `pretest` runs `scripts/setup-test-python.sh` which `uv sync`s two venvs (pinned to Python 3.13 via `.python-version`): the main kernel env at `test/fixtures/python/.venv`, and `test/fixtures/python-unregistered/.venv` — an ipykernel-only env that no test registers with the Python extension itself, used by the step-2 kernel test to prove `notebook_select_kernel` can make a never-before-seen interpreter usable on its own. Tests live in `test/integration/suite/` and are compiled by `tsc -p tsconfig.test.json` to `out/`. The runner downloads a fresh stable VS Code into `.vscode-test/`, installs `ms-toolsai.jupyter` into it, opens the workspace at `test/fixtures/workspace/`, and drives the MCP tools through an in-memory transport (no HTTP). Manual testing still uses `end-to-end-test/test.ipynb` opened in the dev host.
 
+### Two copies of the code in tests
+The integration tests drive tools through an in-memory MCP client built from `out/src/...` (`test/integration/suite/mcpClient.ts`), while VS Code runs the bundled extension from `dist/`. They are separate module instances, so module-level state (running-cell tracking, run-state records, the Plotly renderer) is per copy. Anything `activate()` starts that tools depend on must also be started for the test copy in `createTestMcpClient` (as `watchCellExecution` is); the Plotly test is skipped for this reason. Tool calls from the Jupyter extension's kernel API (`executeCode`) also need a user permission prompt that the test host refuses, so `notebook_inspect_variables` is covered by the manual check.
+
 ### Kernel selection in tests
 The Jupyter extension exposes no public API to assign a kernel to a notebook. The controller-id format Jupyter uses internally (`.jvsc74a57bd0<sha256(normalizedInterpreterPath)>.<normPath>.<normPath>.-m#ipykernel_launcher`) now lives in production code — `controllerIdForInterpreter` / `normalizeInterpreterPath` in `src/utils/kernel.ts`, mirroring `getKernelId` / `getInterpreterKernelSpecName` in microsoft/vscode-jupyter; if Jupyter changes that scheme these break. The helper `selectVenvKernel` in `test/integration/suite/helpers.ts` imports those and dispatches `notebook.selectKernel`, and `notebook_select_kernel`'s `python_path` parameter exposes the same logic to agents so they can attach a kernel by interpreter path without hashing or popping the picker (the former roadmap item, now shipped).
 
@@ -97,16 +100,22 @@ Finish by re-running every code cell in index order so the saved notebook has fr
 ### Access control (`src/mcp/server.ts`)
 Every request must have `Host: 127.0.0.1:<port>` or `localhost:<port>` (DNS-rebinding protection) and no `Origin` header (browsers always send one; MCP clients don't). No CORS headers are sent. `/mcp` also requires `Authorization: Bearer <token>`; `/health` does not. The token is generated on first activation and stored in `context.secrets` (`notebook-mcp.token`). Each window writes `~/.vscode-notebook-mcp/<extension-host pid>.json` with `url`, `port`, `token` and `workspaceFolders` so local clients and scripts can connect; it is removed on deactivate, and files whose pid is no longer running are swept on the next start. Do not reintroduce CORS or unauthenticated routes that reach tools — any web page could otherwise execute code in the kernel.
 
+### stdio bridge (`src/bridge.ts` → `dist/bridge.js`)
+A dependency-free Node script (bundled as a second esbuild entry; it must never import `vscode`). On activation the extension copies it to `~/.vscode-notebook-mcp/bridge.js` (`installBridge`), a path that doesn't change with the extension version, and **Add to Claude Code** registers `node <that path>` as a user-scope stdio server. The bridge picks the live window (pid alive) whose workspace folder most deeply contains `NOTEBOOK_MCP_WORKSPACE` or its cwd (or the only window), forwards each newline-delimited JSON-RPC message as a POST, one at a time and in order, and on 404/401/connection failure re-discovers, replays the saved `initialize` + `notifications/initialized`, and retries. stdout is protocol only; log to stderr.
+
 ### MCP transport — one McpServer per session
 `src/mcp/server.ts` keeps a `Map<sessionId, McpServer>` and a `Map<sessionId, StreamableHTTPServerTransport>`. On the first POST to `/mcp` without a session id, it mints a new UUID, builds a fresh `McpServer` via `createMcpServer()`, registers all tools on it, and connects it to a new transport. Subsequent requests carrying `mcp-session-id` route to the existing pair. `transport.onclose` cleans both maps.
 
-This per-session construction is deliberate (commit `6c02e9a`) — sharing one `McpServer` across sessions caused issues, so do not refactor it back to a singleton.
+This per-session construction is deliberate (commit `6c02e9a`) — sharing one `McpServer` across sessions caused issues, so do not refactor it back to a singleton. Sessions idle for 2 h are closed by a sweep (and the least recently used beyond 32); a request carrying an unknown session id gets **404**, which per the MCP spec makes clients start a new session.
 
 ### Tool registration
 All tools are registered through `registerAllTools(server)` in `src/mcp/tools/index.ts`, which fans out to:
 - `notebooks.ts` — `notebook_list_open`, `notebook_open`
 - `cells.ts` — list / get / insert / edit / replace-in-cell / apply-edits / delete / run / wait / interrupt / clear-output tools, `notebook_save`
 - `kernel.ts` — `notebook_get_kernel_info`, `notebook_select_kernel`, `notebook_restart_kernel`
+- `workflow.ts` — `notebook_status`, `notebook_run_cells`, `notebook_inspect_variables`
+
+Shared result helpers and `runAndDescribe` (run or wait for a cell, return its outputs) live in `tools/common.ts`; the Jupyter API accessors in `utils/jupyter.ts`.
 
 Each tool passes one of the annotation presets from `tools/annotations.ts` (`READ_ONLY`, `EDITS`, `DESTRUCTIVE`, `RUNS_CODE`) so clients can tell reads from edits and code execution. The server also sends MCP `instructions` (top of `server.ts`) telling agents to use these tools, not file tools, for open notebooks and to call `notebook_save` when done, because edits live in the editor until saved.
 
@@ -120,6 +129,12 @@ Every tool accepts an optional `notebook_uri` (omit → active notebook editor) 
 **Cell ids and tracking across edits (`src/utils/notebook.ts`).** Concurrent edits can shift a cell's index while it runs. `runCellAndWait` therefore tracks the `NotebookCell` **object**, which survives inserts/deletes around it (its `index` updates, and is `-1` once the cell itself is deleted). Agents get the same stability through `cellIdOf(cell)`: the nbformat id from `cell.metadata.id` when present (inserted cells get one from `generateCellId`), otherwise a session id kept in a `WeakMap` keyed by the cell object, so no metadata is written. Cell tools resolve their target with `resolveCell(notebook, { cell_id, index })` (`CellTargetSchema`); `cell_id` wins when both are given.
 
 **Long runs.** `runCellAndWait` resolves `{ cell, finished: false }` when `timeout_seconds` passes — that is not an error, the cell keeps running and the tools report `status: "running"` with outputs so far. `execute: false` waits for a run in progress without starting one (`notebook_wait_cell`). `notebook_interrupt_kernel` dispatches `notebook.cell.cancelExecution` over the whole notebook.
+
+**Run state (`src/utils/staleness.ts`).** `watchCellExecution` calls `recordRunStart(cell)` when a run starts (or, for a run that only reports "finished", when it ends), which stores the cell's source for the current kernel session. `runStateOf` compares: `fresh` (unchanged since it ran), `edited`, `not-run` (no run recorded in this session — outputs loaded from disk, or the kernel restarted), `running`. `notebookRunStates` also flags fresh cells after the first stale one (`afterStale`). Restarts reset the record: the restart tool calls `resetSession`, and `watchKernel` subscribes to each notebook kernel's `onDidChangeStatus` so restarts from the editor count too (the Jupyter API has no "kernel started" event). `notebook_status` and `notebook_run_cells` (`mode: "stale"` = first stale cell → end) build on this.
+
+**Agent-edit markers and review (`src/utils/agentEdits.ts`).** Every insert/edit tool calls `markAgentEdits` after applying; a `NotebookCellStatusBarItemProvider` shows the marker until the cell's text differs from what we wrote or it runs. Before applying, tools call `confirmChanges(notebook, summary, changes)`, which returns true immediately unless `notebook-mcp.confirmEdits` is on; then it opens a `vscode.diff` of virtual documents (scheme `notebook-mcp-review`) and waits up to 2 minutes for Apply/Reject on a non-modal notification (a modal would block the diff). Rejection returns `REJECTED_MESSAGE` as a tool error.
+
+**Variable inspection.** `notebook_inspect_variables` uses the Jupyter kernel API's `executeCode`, which doesn't add a cell or touch the execution count. The Python helper is defined inside a function that is deleted afterwards, and prints one `__NBMCP__<json>` line that the tool parses.
 
 **Partial edits.** `findReplaceRanges` implements Edit-tool semantics (exact match, unique unless `replace_all`); `applyCellTextEdits` applies a list of whole-cell or ranged edits in one `WorkspaceEdit`. `notebook_apply_edits` validates every edit (and rejects overlaps) before applying anything.
 
@@ -148,5 +163,6 @@ Users run this next to the Python, Pylance, Jupyter and other notebook/AI extens
 ## Config surface
 
 - `notebook-mcp.port` (number, default 49777) — preferred port; auto-bumps if busy.
-- Commands: `notebook-mcp.restartServer`, `notebook-mcp.showInfo` (status bar click target), `notebook-mcp.copyClaudeCommand` (copies a `claude mcp add … --header "Authorization: Bearer …"` line), `notebook-mcp.regenerateToken`.
+- `notebook-mcp.confirmEdits` (boolean, default false) — review agent changes before they're applied.
+- Commands: `notebook-mcp.restartServer`, `notebook-mcp.showInfo` (status bar click target), `notebook-mcp.addToClaudeCode` (runs `claude mcp add` for the bridge after a modal confirmation), `notebook-mcp.copyClaudeCommand` (copies that command instead), `notebook-mcp.regenerateToken`.
 - One webview panel type: `notebook-mcp.plotlyRenderer`, created on demand as a background editor tab — internal, used only for Plotly rendering.
