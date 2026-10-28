@@ -50,23 +50,84 @@ A VS Code extension that exposes the Jupyter notebooks in your VSCode editor to 
 
 All tools accept an optional `notebook_uri` (omitted → uses the active notebook editor) and `response_format` (`"markdown"` or `"json"`). Cell tools take `cell_id` (from `notebook_list_cells`; it survives inserts and deletes) or `index`. Tools that return outputs take `max_output_chars` (default 20,000; long text keeps its start and end) and `max_images` (default 4), and return one form per output (no HTML duplicate of a DataFrame, no ANSI color codes).
 
-## Setup
+## Installation
 
-1. Install the [Jupyter extension](https://marketplace.visualstudio.com/items?itemName=ms-toolsai.jupyter) in VS Code if you don't already have it.
-2. Build and run this extension:
-   ```bash
-   npm install
-   npm run build
-   ```
-   Then open this folder in VS Code and press **F5** to launch an Extension Development Host with the extension loaded.
-3. Connect your MCP client. For Claude Code, run **Notebook MCP: Add to Claude Code** from the command palette (or **Copy Claude Code Command** and run it yourself). It registers the bundled stdio bridge for all your projects:
+### Requirements
+
+- VS Code 1.85 or later, with the **Python** and **Jupyter** extensions (`ms-python.python`, `ms-toolsai.jupyter`).
+- **Node.js** 18 or later on PATH, to build the extension and to run the bridge that Claude Code talks to.
+- A Python environment with `ipykernel` for your notebooks (what Jupyter in VS Code needs anyway).
+- [Claude Code](https://claude.com/claude-code), or another MCP client.
+
+### Build and install the extension
+
+The extension isn't on the Marketplace; build a `.vsix` and install it:
+
+```bash
+git clone <this repository>
+cd vscode-notebook-mcp
+npm install
+npx @vscode/vsce package --no-dependencies
+code --install-extension vscode-notebook-mcp-0.6.0.vsix
+```
+
+On Windows PowerShell, if scripts are disabled (`npm.ps1 cannot be loaded`), use `npm.cmd` and `npx.cmd` instead, or run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once.
+
+Installing or updating an extension makes VS Code restart the extension host in **every open window**, which stops running Jupyter kernels there. Do it when no notebook has state you want to keep.
+
+After installing, each VS Code window shows a notebook icon with `:49777` (or the next free port) on the right of the status bar. Click it for the server info.
+
+## Connecting Claude Code
+
+1. In VS Code, open the command palette (Ctrl+Shift+P / Cmd+Shift+P) and run **Notebook MCP: Add to Claude Code**, then confirm. This runs, for all your projects:
    ```bash
    claude mcp add --scope user notebook -- node ~/.vscode-notebook-mcp/bridge.js
    ```
-   The bridge connects Claude Code to the VS Code window whose workspace contains the folder Claude Code runs in (override with `NOTEBOOK_MCP_WORKSPACE`), so several windows each get the right notebooks. It reads the port and token from `~/.vscode-notebook-mcp/<pid>.json`, so no token is stored in Claude Code's config, and it reconnects if the window restarts. Requires `node` on PATH.
+   If VS Code can't find the `claude` command, the command is copied to your clipboard instead; run it in a terminal (**Copy Claude Code Command** does the same).
+2. Start a **new** Claude Code session from your project folder. Claude Code loads MCP servers when a session starts.
+3. Check the connection from that folder:
+   ```bash
+   claude mcp get notebook
+   ```
+   It should say "Connected". The bridge talks to the VS Code window whose workspace contains the folder Claude Code runs in, so open the project folder in VS Code first. With several windows open, each project reaches its own window; to point at a different folder, set `NOTEBOOK_MCP_WORKSPACE`.
 
-   Other clients can talk HTTP directly: the URL and bearer token are in `~/.vscode-notebook-mcp/<pid>.json` (one file per window). To keep the token out of a checked-in `.mcp.json`, reference an environment variable: `"headers": { "Authorization": "Bearer ${NOTEBOOK_MCP_TOKEN}" }`.
-4. Open a `.ipynb` file in the Extension Development Host. Look for the `🪐 :49777` indicator in the status bar.
+No token is stored in Claude Code's config: the bridge reads it from `~/.vscode-notebook-mcp/<pid>.json`, which each window writes when it starts.
+
+Other MCP clients can use the bridge the same way (a stdio server: `node ~/.vscode-notebook-mcp/bridge.js`), or talk HTTP directly to the URL in that file with `Authorization: Bearer <token>`. To keep the token out of a checked-in `.mcp.json`, reference an environment variable: `"headers": { "Authorization": "Bearer ${NOTEBOOK_MCP_TOKEN}" }`.
+
+## Using it
+
+Open the notebook in VS Code, then ask Claude Code about it in plain language. It sees the notebook as it is in the editor (including unsaved changes and the running kernel), and its edits land in the editor, where you can undo them.
+
+Examples of what to ask:
+
+- "Look at `analysis.ipynb`. Which cells are out of date, and bring the kernel up to date." → `notebook_status`, then `notebook_run_cells` with `mode: "stale"`.
+- "In the cell that loads the data, change the date filter to 2024 and rerun everything after it." → `notebook_replace_in_cell` (changes only that line), then `notebook_run_cells`.
+- "What's in the kernel right now? I need the shape of `df` and the columns." → `notebook_inspect_variables` (no cell is added, the execution count doesn't change).
+- "Run the training cell; it takes about 10 minutes." → `notebook_run_cell` returns `running` after its timeout with the output so far; Claude Code keeps waiting with `notebook_wait_cell`, or stops it with `notebook_interrupt_kernel` if you ask.
+- "Fix the error in cell 7 and save the notebook." → edit, run, `notebook_save`.
+
+What you'll see in VS Code:
+
+- Cells Claude changed or inserted show **Changed by agent** / **Inserted by agent** in their cell status bar until you edit or run them. Undo with Ctrl+Z (Cmd+Z) in the notebook.
+- The first time Claude inspects variables, Jupyter asks *"Do you want to grant Kernel access to the extension VS Code Notebook MCP?"*. Choose **Allow** (once). To change it later, run **Jupyter: Manage Access To Jupyter Kernels**.
+- To approve every change before it's applied, turn on the setting `notebook-mcp.confirmEdits`: a diff opens and a notification asks **Apply** or **Reject** (no answer in 2 minutes rejects).
+- Edits stay in the editor until saved. Claude Code is told to use these tools, not its file tools, for open notebooks, and to call `notebook_save` when done.
+
+The kernel is chosen the way you'd expect: if the notebook already has a running kernel, it is kept; otherwise the workspace's selected Python interpreter is used. Claude Code only switches to a different kernel if you ask it to (switching discards the kernel's variables), and it puts your workspace's Python interpreter back afterwards.
+
+## Troubleshooting
+
+| Symptom | What to do |
+|---|---|
+| `claude mcp get notebook` fails: "No VS Code window with Notebook MCP is open for …" | Open that folder (or a parent) in VS Code, or set `NOTEBOOK_MCP_WORKSPACE` to the folder of an open window. |
+| Claude Code doesn't list the notebook tools | Start a new Claude Code session; check `claude mcp list`. |
+| The status bar shows the notebook icon with `✗` | Click it for the error, then **Restart**. Another program may hold the ports 49777–49876; set `notebook-mcp.port`. |
+| `notebook_inspect_variables` says it has no kernel access | Run **Jupyter: Manage Access To Jupyter Kernels** and allow VS Code Notebook MCP. |
+| An interrupt doesn't stop a cell on Windows | `time.sleep` and some C extensions can't be interrupted until they return. Wait (`notebook_wait_cell`) or restart the kernel. |
+| You think the token leaked | Run **Notebook MCP: Regenerate Access Token**. The bridge picks up the new one automatically. |
+
+For development (running from source with F5, tests), see [Development](#development).
 
 ### Security
 
