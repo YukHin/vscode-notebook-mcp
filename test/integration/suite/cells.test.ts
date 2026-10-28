@@ -167,6 +167,146 @@ suite("cell tools (no execution)", () => {
     assert.strictEqual(JSON.parse(result.text).total, 3);
   });
 
+  test("cell_id keeps pointing at the same cell after an insert above it", async () => {
+    const uri = await openFixture(mcp, "with-cells.ipynb");
+    const list = await callTool(mcp.client, "notebook_list_cells", {
+      notebook_uri: uri,
+      response_format: "json"
+    });
+    const codeCell = JSON.parse(list.text).cells[1];
+    assert.ok(codeCell.id, "expected every cell to have an id");
+
+    await callTool(mcp.client, "notebook_insert_cell", {
+      notebook_uri: uri,
+      content: "# shifts everything down",
+      type: "markdown",
+      index: 0
+    });
+
+    const get = await callTool(mcp.client, "notebook_get_cell_content", {
+      notebook_uri: uri,
+      cell_id: codeCell.id,
+      response_format: "json"
+    });
+    assert.strictEqual(get.isError, false, get.text);
+    const parsed = JSON.parse(get.text);
+    assert.strictEqual(parsed.index, 2);
+    assert.match(parsed.content, /x = 21 \+ 21/);
+  });
+
+  test("cell tools require cell_id or index", async () => {
+    const uri = await openFixture(mcp, "with-cells.ipynb");
+    const result = await callTool(mcp.client, "notebook_get_cell_content", {
+      notebook_uri: uri
+    });
+    assert.strictEqual(result.isError, true);
+    assert.match(result.text, /cell_id or index/);
+  });
+
+  test("notebook_replace_in_cell changes only the matched text", async () => {
+    const uri = await openFixture(mcp, "with-cells.ipynb");
+    await callTool(mcp.client, "notebook_edit_cell", {
+      notebook_uri: uri,
+      index: 1,
+      content: "a = 1\nb = 2\nprint(a + b)"
+    });
+    const replace = await callTool(mcp.client, "notebook_replace_in_cell", {
+      notebook_uri: uri,
+      index: 1,
+      old_string: "b = 2",
+      new_string: "b = 20",
+      response_format: "json"
+    });
+    assert.strictEqual(replace.isError, false, replace.text);
+    assert.strictEqual(JSON.parse(replace.text).replacements, 1);
+
+    const get = await callTool(mcp.client, "notebook_get_cell_content", {
+      notebook_uri: uri,
+      index: 1,
+      response_format: "json"
+    });
+    assert.strictEqual(JSON.parse(get.text).content, "a = 1\nb = 20\nprint(a + b)");
+  });
+
+  test("notebook_replace_in_cell refuses ambiguous and missing matches", async () => {
+    const uri = await openFixture(mcp, "with-cells.ipynb");
+    await callTool(mcp.client, "notebook_edit_cell", {
+      notebook_uri: uri,
+      index: 1,
+      content: "x = 1\nx = 1"
+    });
+    const ambiguous = await callTool(mcp.client, "notebook_replace_in_cell", {
+      notebook_uri: uri,
+      index: 1,
+      old_string: "x = 1",
+      new_string: "x = 2"
+    });
+    assert.strictEqual(ambiguous.isError, true);
+    assert.match(ambiguous.text, /occurs 2 times/);
+
+    const missing = await callTool(mcp.client, "notebook_replace_in_cell", {
+      notebook_uri: uri,
+      index: 1,
+      old_string: "y = 1",
+      new_string: "y = 2"
+    });
+    assert.strictEqual(missing.isError, true);
+    assert.match(missing.text, /not found/);
+
+    const all = await callTool(mcp.client, "notebook_replace_in_cell", {
+      notebook_uri: uri,
+      index: 1,
+      old_string: "x = 1",
+      new_string: "x = 2",
+      replace_all: true,
+      response_format: "json"
+    });
+    assert.strictEqual(JSON.parse(all.text).replacements, 2);
+  });
+
+  test("notebook_apply_edits applies every edit or none", async () => {
+    const uri = await openFixture(mcp, "with-cells.ipynb");
+    const before = await callTool(mcp.client, "notebook_get_cell_content", {
+      notebook_uri: uri,
+      index: 1,
+      response_format: "json"
+    });
+    const original = JSON.parse(before.text).content as string;
+
+    const bad = await callTool(mcp.client, "notebook_apply_edits", {
+      notebook_uri: uri,
+      edits: [
+        { index: 1, old_string: "21 + 21", new_string: "40 + 2" },
+        { index: 0, old_string: "this text is not there", new_string: "x" }
+      ]
+    });
+    assert.strictEqual(bad.isError, true);
+    assert.match(bad.text, /no edits were applied/);
+    const unchanged = await callTool(mcp.client, "notebook_get_cell_content", {
+      notebook_uri: uri,
+      index: 1,
+      response_format: "json"
+    });
+    assert.strictEqual(JSON.parse(unchanged.text).content, original);
+
+    const good = await callTool(mcp.client, "notebook_apply_edits", {
+      notebook_uri: uri,
+      edits: [
+        { index: 1, old_string: "21 + 21", new_string: "40 + 2" },
+        { index: 0, content: "# Rewritten title" }
+      ],
+      response_format: "json"
+    });
+    assert.strictEqual(good.isError, false, good.text);
+    assert.strictEqual(JSON.parse(good.text).applied, 2);
+    const after = await callTool(mcp.client, "notebook_get_cell_content", {
+      notebook_uri: uri,
+      index: 1,
+      response_format: "json"
+    });
+    assert.match(JSON.parse(after.text).content, /x = 40 \+ 2/);
+  });
+
   test("no-active-editor: tools error helpfully when no notebook is open", async () => {
     await closeAllEditors();
     const result = await callTool(mcp.client, "notebook_list_cells", {

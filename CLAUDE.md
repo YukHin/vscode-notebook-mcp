@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A VS Code extension (`extensionDependencies: ms-toolsai.jupyter`) that runs an embedded HTTP MCP server inside the VS Code extension host. It exposes the Jupyter notebooks already open in the user's editor — and their kernels — to MCP-compatible AI agents (Claude Code, Cursor, etc.). All notebook reads/writes/executions go through the live VS Code Notebook API, so they share state with the editor (undo/redo, the same kernel, the same outputs).
+A VS Code extension (requires `ms-toolsai.jupyter`, activated lazily on first use) that runs an embedded HTTP MCP server inside the VS Code extension host. It exposes the Jupyter notebooks already open in the user's editor — and their kernels — to MCP-compatible AI agents (Claude Code, Cursor, etc.). All notebook reads/writes/executions go through the live VS Code Notebook API, so they share state with the editor (undo/redo, the same kernel, the same outputs).
 
 ## Commands
 
@@ -105,7 +105,7 @@ This per-session construction is deliberate (commit `6c02e9a`) — sharing one `
 ### Tool registration
 All tools are registered through `registerAllTools(server)` in `src/mcp/tools/index.ts`, which fans out to:
 - `notebooks.ts` — `notebook_list_open`, `notebook_open`
-- `cells.ts` — list / get / insert / edit / delete / run / clear-output tools, `notebook_save`
+- `cells.ts` — list / get / insert / edit / replace-in-cell / apply-edits / delete / run / wait / interrupt / clear-output tools, `notebook_save`
 - `kernel.ts` — `notebook_get_kernel_info`, `notebook_select_kernel`, `notebook_restart_kernel`
 
 Each tool passes one of the annotation presets from `tools/annotations.ts` (`READ_ONLY`, `EDITS`, `DESTRUCTIVE`, `RUNS_CODE`) so clients can tell reads from edits and code execution. The server also sends MCP `instructions` (top of `server.ts`) telling agents to use these tools, not file tools, for open notebooks and to call `notebook_save` when done, because edits live in the editor until saved.
@@ -117,25 +117,36 @@ Every tool accepts an optional `notebook_uri` (omit → active notebook editor) 
 
 ### Three non-obvious mechanics
 
-**Cell tracking across edits (`src/utils/notebook.ts`).** Concurrent edits can shift a cell's index while it runs. `runCellAndWait` therefore tracks the `NotebookCell` **object**, which survives inserts/deletes around it (its `index` updates, and is `-1` once the cell itself is deleted). Inserted cells still get a `metadata.id` (`generateCellId`) so `notebook_insert_cell` can find the cell it just inserted.
+**Cell ids and tracking across edits (`src/utils/notebook.ts`).** Concurrent edits can shift a cell's index while it runs. `runCellAndWait` therefore tracks the `NotebookCell` **object**, which survives inserts/deletes around it (its `index` updates, and is `-1` once the cell itself is deleted). Agents get the same stability through `cellIdOf(cell)`: the nbformat id from `cell.metadata.id` when present (inserted cells get one from `generateCellId`), otherwise a session id kept in a `WeakMap` keyed by the cell object, so no metadata is written. Cell tools resolve their target with `resolveCell(notebook, { cell_id, index })` (`CellTargetSchema`); `cell_id` wins when both are given.
+
+**Long runs.** `runCellAndWait` resolves `{ cell, finished: false }` when `timeout_seconds` passes — that is not an error, the cell keeps running and the tools report `status: "running"` with outputs so far. `execute: false` waits for a run in progress without starting one (`notebook_wait_cell`). `notebook_interrupt_kernel` dispatches `notebook.cell.cancelExecution` over the whole notebook.
+
+**Partial edits.** `findReplaceRanges` implements Edit-tool semantics (exact match, unique unless `replace_all`); `applyCellTextEdits` applies a list of whole-cell or ranged edits in one `WorkspaceEdit`. `notebook_apply_edits` validates every edit (and rejects overlaps) before applying anything.
 
 **Execution completion detection.** VS Code creates `cell.executionSummary` (with `timing.startTime`) as soon as a run starts but only assigns `executionSummary.success` to a boolean once the kernel reports completion. `runCellAndWait` waits for `typeof success === "boolean"` **and** a summary that differs from the snapshot taken before the run (execution order or start time) — a cell that ran before already has a boolean `success`, and `notebook.cell.execute` can return before the new run starts, so checking `success` alone returns the previous run's outputs. Do not switch to checking `timing.endTime` or relying on the command awaitable, both of which return before the kernel is done. It listens to `onDidChangeNotebookDocument`, with a 1 s poll as a fallback.
 
-**Plotly rendering via a hidden WebviewView (`src/utils/plotly.ts`).** Plotly outputs (`application/vnd.plotly.v1+json`) are not images out of the box — Jupyter ships JSON figure specs. We can't run `plotly.js` in the extension host (no DOM), so the extension contributes a `webviewView` (id `notebook-mcp.plotlyRenderer`) to a panel container. `parseOutputs` posts each figure to that webview, which calls `Plotly.newPlot` + `Plotly.toImage` and posts back a PNG data URL. The webview is set up with `retainContextWhenHidden: true` and the panel is auto-closed after the first resolve, so the renderer stays warm but invisible. Plotly is bundled at build time by `npm run copy:plotly` (which copies `plotly.min.js` into `dist/`) so the webview can load it as a local resource under the strict CSP.
+**Plotly rendering via a WebviewPanel (`src/utils/plotly.ts`).** Plotly outputs (`application/vnd.plotly.v1+json`) are not images out of the box — Jupyter ships JSON figure specs. We can't run `plotly.js` in the extension host (no DOM), so the extension uses a `WebviewPanel` (view type `notebook-mcp.plotlyRenderer`) in the active editor group. `parseOutputs` posts each figure to that webview, which calls `Plotly.newPlot` + `Plotly.toImage` and posts back a PNG data URL. **VS Code gives hidden webviews no time to run** (a background tab never answers, not even its `ready` message), so `renderInPanel` reveals the tab with `preserveFocus` for the render, and `parseOutputs` calls `restoreAfterRendering()` in `finally` — once per call, before the tool replies, because the agent's next call may rely on the active notebook. The editor to restore falls back to `lastEditor` (tracked via active-editor events) since the active editor can be undefined at that moment. Between renders the tab stays in the background (`retainContextWhenHidden`); if the user closes it, the next render recreates it. It used to be a panel `webviewView`, and closing the panel after resolving it hid the user's terminal — don't move it back to the panel. Plotly is bundled at build time by `npm run copy:plotly` (which copies `plotly.min.js` into `dist/`) so the webview can load it as a local resource under the strict CSP.
 
 ### Edit semantics
 - All structural changes (insert/delete) go through `vscode.NotebookEdit` + `vscode.WorkspaceEdit` (`utils/notebook.ts`) so they participate in undo/redo.
 - Cell content edits use `WorkspaceEdit.replace` against the cell's text document.
 - Output clearing and execution use VS Code commands (`notebook.cell.clearOutputs`, `notebook.cell.execute`) addressed by `{ ranges, document: notebook.uri }`.
 
+### Coexisting with other extensions
+Users run this next to the Python, Pylance, Jupyter and other notebook/AI extensions, so it must not change their state as a side effect:
+- No `extensionDependencies`: that would force Jupyter to activate in every window at startup. Jupyter and Python are activated on demand (`getJupyterApi`, `registerInterpreter`), and the README lists Jupyter as a requirement.
+- `notebook_select_kernel` follows the user's setup by default: no arguments → keep the running kernel (`mode: "kept"`), else attach `getWorkspaceInterpreter()` (`mode: "workspace-interpreter"`), else the picker. An explicit `kernel_id`/`python_path` never replaces a running kernel unless `replace_running_kernel` is set. "Running" means `kernels.getKernel()` returns one; a selected controller that hasn't executed anything yet is invisible to the Jupyter API and counts as not running.
+- `registerInterpreter` has to set the workspace's active Python interpreter (Jupyter only creates a controller for a selected interpreter — being "known" isn't enough; skipping this makes the next run pop an unanswerable kernel picker). It returns `restore()`, which `notebook_select_kernel` always calls in `finally`, because the active interpreter is shared with Pylance, terminals, debugging and testing.
+- Every contributed id (commands, settings, webview type) is prefixed `notebook-mcp.`. Don't contribute keybindings or panel views, and don't open or close workbench parts.
+
 ### Kernel access
 `kernel.ts` activates the Jupyter extension (`ms-toolsai.jupyter`) on demand and caches the API in `jupyterApi`. Kernel info comes from `api.kernels.getKernel(notebook.uri)`. Kernel selection goes through the `notebook.selectKernel` command — programmatic when a `kernel_id` is passed, picker UI when omitted.
 
 ### Output parsing (`src/utils/output.ts`)
-`parseOutputs` walks `NotebookCellOutput.items` and produces a tagged union of `TextOutput | ErrorOutput | ImageOutput`. Errors are detected by mime — it compares against `vscode.NotebookCellOutputItem.error(new Error("")).mime` (computed once at module load) rather than hard-coding the mime string. Images are base64-encoded. Text outputs are truncated at 25,000 characters with a trailing length marker. If an output contains a Plotly mime item, the textual fallbacks in the same output are skipped in favor of the rendered PNG.
+`parseOutputs(outputs, budget)` produces a tagged union of `TextOutput | ErrorOutput | ImageOutput`, **one per output**: the items of a `NotebookCellOutput` are alternative forms of the same data, so it picks Plotly (rendered to PNG) → error → image (`IMAGE_MIMES`) → text (`TEXT_MIMES`: stdout, stderr, markdown, plain, latex, json, html), and replaces widget/JavaScript outputs with a note. Errors are detected by mime — it compares against `vscode.NotebookCellOutputItem.error(new Error("")).mime` (computed once at module load) rather than hard-coding the mime string. ANSI codes are stripped. Images beyond `budget.maxImages` fall back to the output's text form; images over 3.5 MB are dropped with a note (the API rejects >5 MB base64). `applyTextBudget` then fits all text and tracebacks into `budget.maxChars` by fair share, cutting the middle and keeping two thirds at the end. Markdown results use `fenced()` so content with backticks can't close the fence.
 
 ## Config surface
 
 - `notebook-mcp.port` (number, default 49777) — preferred port; auto-bumps if busy.
 - Commands: `notebook-mcp.restartServer`, `notebook-mcp.showInfo` (status bar click target), `notebook-mcp.copyClaudeCommand` (copies a `claude mcp add … --header "Authorization: Bearer …"` line), `notebook-mcp.regenerateToken`.
-- One webview view: `notebook-mcp.plotlyRenderer` in a `notebook-mcp-utility` panel container — internal, used only for Plotly rendering.
+- One webview panel type: `notebook-mcp.plotlyRenderer`, created on demand as a background editor tab — internal, used only for Plotly rendering.

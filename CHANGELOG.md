@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-10-28
+
+### Added
+
+- `notebook_replace_in_cell` — replace one exact piece of text in a cell (unique match required unless `replace_all`), leaving the rest of the cell alone.
+- `notebook_apply_edits` — several replace / whole-cell edits across cells, validated up front and applied in one workspace edit; if any edit fails, nothing changes.
+- Stable cell ids. `notebook_list_cells` returns an `id` per cell (the nbformat id when the notebook has one, otherwise a session id), and every cell tool accepts `cell_id` as well as `index`.
+- `timeout_seconds` on `notebook_run_cell` and `notebook_insert_cell`. A run that outlasts it returns `status: "running"` with the outputs so far instead of failing, and keeps running.
+- `notebook_wait_cell` — wait for a running cell without starting it again.
+- `notebook_interrupt_kernel` — stop running and queued cells without losing kernel state.
+- `max_output_chars` and `max_images` on the tools that return outputs.
+
+### Changed
+
+- Each output is returned in one form, picked by preference (image, then stdout/stderr, Markdown, plain text, LaTeX, JSON, HTML), instead of every mime type it carries; a DataFrame no longer comes back as both HTML and text. Widget and JavaScript outputs are replaced by a short note.
+- Text across all outputs of a call is fitted into `max_output_chars` (default 20,000), cutting long pieces in the middle and keeping the end. Images beyond `max_images` (default 4) or larger than 3.5 MB are replaced by a note.
+- ANSI color codes are stripped from tracebacks and text.
+- Code fences in Markdown results grow longer than any backtick run in the content, so cells containing ``` no longer break the formatting.
+- The Plotly renderer is now an editor tab instead of a bottom-panel view. Rendering a Plotly figure no longer closes the panel (and with it the terminal).
+- `index` is now optional on cell tools; pass `cell_id` or `index`.
+- `notebook_select_kernel` now defaults to the user's setup. Without `kernel_id`/`python_path` it keeps a running kernel, or else attaches the workspace's selected Python interpreter (resolving conda-style environment folders to their executable), and only opens the picker when there is none. With an explicit choice it refuses to replace a running kernel unless `replace_running_kernel: true`, since switching discards the kernel's variables.
+- `notebook_select_kernel` with `python_path` no longer leaves the workspace's Python interpreter changed. It still has to select the interpreter briefly so Jupyter creates a kernel for it, but switches the workspace back once the kernel is selected (reported as `workspaceInterpreterRestored`), so Pylance, terminals and debugging keep the user's choice.
+- `notebook_list_cells`, `notebook_get_cell_output` and `notebook_interrupt_kernel` now see cells that are running, including runs started from the editor. Running cells were never detected before, because the Jupyter kernel gives a running cell no start time.
+- `notebook_interrupt_kernel` uses Jupyter's interrupt command and returns within about 10 seconds even when the code ignores the interrupt (on Windows, `time.sleep` can't be interrupted until it returns).
+- Plotly rendering works on repeated calls. VS Code doesn't run hidden webviews, so the renderer tab is shown (without taking focus) while figures render, and the previous editor is back in front before the tool replies — once per call, however many figures it has.
+- Removed `extensionDependencies` on the Jupyter extension, which forced Jupyter to activate in every window at startup. Jupyter is still required and is activated when a tool first needs it.
+
+### Internal
+
+- Integration tests resolve venv interpreters with `Scripts\python.exe` on Windows.
+
 ## [0.4.0] - 2026-10-28
 
 ### Security

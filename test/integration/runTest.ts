@@ -30,10 +30,12 @@ async function main() {
   // optional/extension-pack dependencies; without it the Python extension API
   // is unavailable and kernel selection cannot work.
   for (const extId of ["ms-python.python", "ms-toolsai.jupyter"]) {
+    // On Windows the CLI is a .cmd script, which Node only runs through a shell.
+    const isWindows = process.platform === "win32";
     const install = spawnSync(
-      cli,
+      isWindows ? `"${cli}"` : cli,
       [...cliArgs, "--install-extension", extId, "--force"],
-      { encoding: "utf-8", stdio: "inherit" }
+      { encoding: "utf-8", stdio: "inherit", shell: isWindows }
     );
     if (install.status !== 0) {
       throw new Error(`failed to install ${extId} into the test VS Code`);

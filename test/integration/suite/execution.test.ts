@@ -157,6 +157,152 @@ suite("cell execution", () => {
     );
   });
 
+  test("re-running a cell returns the new run's output, not the previous one", async () => {
+    const uri = await openWithKernel(mcp, "empty.ipynb");
+    await callTool(mcp.client, "notebook_insert_cell", {
+      notebook_uri: uri,
+      content: "n = 0",
+      type: "code",
+      execute: true
+    });
+    await callTool(mcp.client, "notebook_insert_cell", {
+      notebook_uri: uri,
+      content: "n += 1\nprint(n)",
+      type: "code"
+    });
+    const texts: string[] = [];
+    for (let i = 0; i < 2; i++) {
+      const run = await callTool(mcp.client, "notebook_run_cell", {
+        notebook_uri: uri,
+        index: 1,
+        response_format: "json"
+      });
+      texts.push(
+        JSON.parse(run.text)
+          .outputs.map((o: { text?: string }) => o.text ?? "")
+          .join("")
+          .trim()
+      );
+    }
+    assert.deepStrictEqual(texts, ["1", "2"]);
+  });
+
+  test("a run longer than timeout_seconds reports 'running', and notebook_wait_cell picks it up", async () => {
+    const uri = await openWithKernel(mcp, "empty.ipynb");
+    const insert = await callTool(mcp.client, "notebook_insert_cell", {
+      notebook_uri: uri,
+      content: "import time\nprint('started', flush=True)\ntime.sleep(4)\nprint('done')",
+      type: "code",
+      execute: true,
+      timeout_seconds: 1,
+      response_format: "json"
+    });
+    const first = JSON.parse(insert.text);
+    assert.strictEqual(first.execution.status, "running", insert.text);
+    assert.strictEqual(first.execution.success, null);
+
+    const wait = await callTool(mcp.client, "notebook_wait_cell", {
+      notebook_uri: uri,
+      cell_id: first.cellId,
+      timeout_seconds: 30,
+      response_format: "json"
+    });
+    const done = JSON.parse(wait.text);
+    assert.strictEqual(done.status, "finished", wait.text);
+    assert.strictEqual(done.success, true);
+    assert.match(done.outputs.map((o: { text?: string }) => o.text ?? "").join(""), /done/);
+  });
+
+  test("notebook_interrupt_kernel stops a running cell and keeps variables", async () => {
+    const uri = await openWithKernel(mcp, "empty.ipynb");
+    await callTool(mcp.client, "notebook_insert_cell", {
+      notebook_uri: uri,
+      content: "kept = 'still here'",
+      type: "code",
+      execute: true
+    });
+    // A busy loop rather than time.sleep: on Windows, ipykernel's interrupt
+    // can't break out of time.sleep until it returns.
+    const slow = await callTool(mcp.client, "notebook_insert_cell", {
+      notebook_uri: uri,
+      content: "import time\nt = time.time()\nwhile time.time() - t < 60:\n    pass",
+      type: "code",
+      execute: true,
+      timeout_seconds: 1,
+      response_format: "json"
+    });
+    assert.strictEqual(JSON.parse(slow.text).execution.status, "running");
+
+    const interrupt = await callTool(mcp.client, "notebook_interrupt_kernel", {
+      notebook_uri: uri,
+      response_format: "json"
+    });
+    assert.strictEqual(interrupt.isError, false, interrupt.text);
+    assert.deepStrictEqual(JSON.parse(interrupt.text).stillRunning, []);
+
+    const check = await callTool(mcp.client, "notebook_insert_cell", {
+      notebook_uri: uri,
+      content: "print(kept)",
+      type: "code",
+      execute: true,
+      timeout_seconds: 20,
+      response_format: "json"
+    });
+    assert.match(
+      JSON.parse(check.text).execution.outputs.map((o: { text?: string }) => o.text ?? "").join(""),
+      /still here/
+    );
+  });
+
+  test("errors come back without terminal color codes", async () => {
+    const uri = await openWithKernel(mcp, "empty.ipynb");
+    const result = await callTool(mcp.client, "notebook_insert_cell", {
+      notebook_uri: uri,
+      content: "def f():\n    raise KeyError('missing')\nf()",
+      type: "code",
+      execute: true,
+      response_format: "json"
+    });
+    const error = JSON.parse(result.text).execution.outputs.find(
+      (o: { type: string }) => o.type === "error"
+    );
+    assert.ok(error, result.text);
+    assert.ok(!/\u001b\[/.test(error.stack), "stack still contains ANSI escape codes");
+    assert.match(error.stack, /KeyError/);
+  });
+
+  test("long text output is trimmed to max_output_chars, keeping the end", async () => {
+    const uri = await openWithKernel(mcp, "empty.ipynb");
+    const result = await callTool(mcp.client, "notebook_insert_cell", {
+      notebook_uri: uri,
+      content: "print('a' * 50000 + 'THE-END')",
+      type: "code",
+      execute: true,
+      max_output_chars: 1000,
+      response_format: "json"
+    });
+    const text = JSON.parse(result.text)
+      .execution.outputs.map((o: { text?: string }) => o.text ?? "")
+      .join("");
+    assert.ok(text.length < 1200, `expected trimmed output, got ${text.length} chars`);
+    assert.match(text, /characters omitted/);
+    assert.match(text, /THE-END/);
+  });
+
+  test("an output with both HTML and plain text comes back once, as plain text", async () => {
+    const uri = await openWithKernel(mcp, "empty.ipynb");
+    const result = await callTool(mcp.client, "notebook_insert_cell", {
+      notebook_uri: uri,
+      content: "from IPython.display import display, HTML\ndisplay({'text/plain': 'plain form', 'text/html': '<b>html form</b>'}, raw=True)",
+      type: "code",
+      execute: true,
+      response_format: "json"
+    });
+    const outputs = JSON.parse(result.text).execution.outputs;
+    assert.strictEqual(outputs.length, 1, result.text);
+    assert.strictEqual(outputs[0].text, "plain form");
+  });
+
   test("inserting cells while another cell is executing does not lose track of the inserted cell", async () => {
     const uri = await openWithKernel(mcp, "empty.ipynb");
 

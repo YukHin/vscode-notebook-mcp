@@ -5,6 +5,7 @@ import * as path from "path";
 import * as vscode from "vscode";
 import { startMCPServer, ServerHandle } from "./mcp/server.js";
 import { initPlotlyRenderer } from "./utils/plotly.js";
+import { watchCellExecution } from "./utils/notebook.js";
 
 const TOKEN_SECRET_KEY = "notebook-mcp.token";
 // One JSON file per running window, so local clients can find the port and
@@ -20,6 +21,7 @@ let token: string | undefined;
 
 export async function activate(context: vscode.ExtensionContext) {
   extensionContext = context;
+  watchCellExecution(context);
   initPlotlyRenderer(context);
   statusBarItem = vscode.window.createStatusBarItem(
     vscode.StatusBarAlignment.Right,

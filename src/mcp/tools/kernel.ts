@@ -5,12 +5,16 @@ import {
   ResponseFormatSchema,
   NotebookUriSchema
 } from "../../schemas/index.js";
-import { resolveNotebook } from "../../utils/notebook.js";
+import { resolveNotebook, forgetRuns } from "../../utils/notebook.js";
 import {
   controllerIdForInterpreter,
   selectKernelById
 } from "../../utils/kernel.js";
-import { registerInterpreter } from "../../utils/pythonEnv.js";
+import {
+  registerInterpreter,
+  getWorkspaceInterpreter,
+  InterpreterRegistration
+} from "../../utils/pythonEnv.js";
 import { READ_ONLY, EDITS, DESTRUCTIVE } from "./annotations.js";
 
 const TextResult = (text: string) =>
@@ -121,13 +125,19 @@ const SelectKernelInput = {
     .string()
     .optional()
     .describe(
-      "Kernel controller id (e.g. 'python3' or a Jupyter kernelspec id). Takes precedence over python_path. If both are omitted, opens the kernel picker UI."
+      "Kernel controller id (e.g. 'python3' or a Jupyter kernelspec id). Takes precedence over python_path. Omit both to use what the user already has."
     ),
   python_path: z
     .string()
     .optional()
     .describe(
-      "Absolute path to a Python interpreter (e.g. a venv's bin/python). The matching Jupyter controller id is computed automatically — no need to hash anything. Ignored if kernel_id is given."
+      "Absolute path to a Python interpreter (e.g. a venv's bin/python or Scripts\\python.exe). The matching Jupyter controller id is computed automatically. Ignored if kernel_id is given. Omit both to use what the user already has."
+    ),
+  replace_running_kernel: z
+    .boolean()
+    .default(false)
+    .describe(
+      "Allow switching away from a kernel that is already running for this notebook. Switching discards that kernel's variables, so only set this when the user asked for a different kernel."
     ),
   notebook_uri: NotebookUriSchema,
   response_format: ResponseFormatSchema
@@ -190,30 +200,74 @@ export function registerKernelTools(server: McpServer): void {
 
   server.tool(
     "notebook_select_kernel",
-    "Select a kernel for a notebook. With kernel_id or python_path, attempts to set it directly; without either, opens the VS Code kernel picker for the user.",
+    "Make sure a notebook has a kernel, respecting the user's setup. Without kernel_id or python_path: keeps the kernel that is already running, or else attaches the workspace's selected Python interpreter (the one Pylance and the terminal use), and only opens the picker if there is none. With kernel_id or python_path: attaches that kernel, but refuses to replace a running kernel unless replace_running_kernel is true. A kernel that was selected but has not run any cell yet counts as not running.",
     SelectKernelInput,
     EDITS,
-    async ({ kernel_id, python_path, notebook_uri, response_format }) => {
+    async ({ kernel_id, python_path, replace_running_kernel, notebook_uri, response_format }) => {
       const access = await resolveNotebook(notebook_uri);
       if (!access.allowed) return ErrorResult(`Error: ${access.error}`);
       const notebook = access.notebook!;
+
+      let current: any;
+      try {
+        const api = await getJupyterApi();
+        current = await api?.kernels?.getKernel?.(notebook.uri);
+      } catch {
+        // no Jupyter API: treat as no running kernel
+      }
+      const explicit = kernel_id !== undefined || python_path !== undefined;
+
+      if (current && !explicit) {
+        const kept = {
+          notebookUri: notebook.uri.toString(),
+          mode: "kept",
+          connected: true,
+          language: current.language ?? null,
+          status: current.status ?? null
+        };
+        if (response_format === "json") {
+          return TextResult(JSON.stringify(kept, null, 2));
+        }
+        return TextResult(
+          `# Kernel Selection\n\nKept the kernel that is already running: ${kept.language} (${kept.status}). Nothing was changed.`
+        );
+      }
+      if (current && explicit && !replace_running_kernel) {
+        return ErrorResult(
+          `Error: this notebook already has a running ${current.language ?? ""} kernel (${current.status ?? "unknown"}). Switching kernels discards its variables. Omit kernel_id/python_path to keep it, or pass replace_running_kernel: true if the user asked to switch.`
+        );
+      }
+
+      // With no explicit choice, use the interpreter the user already picked
+      // for this workspace rather than a picker an agent can't operate.
+      let pythonPath = python_path;
+      let mode = kernel_id || python_path ? "programmatic" : "picker";
+      if (!explicit) {
+        const workspaceInterpreter = await getWorkspaceInterpreter(notebook.uri);
+        if (workspaceInterpreter) {
+          pythonPath = workspaceInterpreter;
+          mode = "workspace-interpreter";
+        }
+      }
 
       // Prefer an explicit kernel_id; otherwise derive the controller id from
       // the interpreter path so callers never have to hash it themselves.
       const effectiveKernelId =
         kernel_id ??
-        (python_path ? controllerIdForInterpreter(python_path) : undefined);
+        (pythonPath ? controllerIdForInterpreter(pythonPath) : undefined);
 
+      let registration: InterpreterRegistration | undefined;
+      let interpreterRestored = false;
       try {
         // Make the Python extension aware of the interpreter first, so a venv
         // the user has never selected in VS Code still gets a controller to
         // bind to. Best effort: if it fails we still try to select by id.
-        if (python_path) {
+        if (pythonPath) {
           try {
-            await registerInterpreter(python_path);
+            registration = await registerInterpreter(pythonPath);
           } catch (err) {
             console.error(
-              `[notebook_select_kernel] could not register interpreter ${python_path}: ${
+              `[notebook_select_kernel] could not register interpreter ${pythonPath}: ${
                 err instanceof Error ? err.message : String(err)
               }`
             );
@@ -226,7 +280,7 @@ export function registerKernelTools(server: McpServer): void {
           await selectKernelById(
             notebook.uri,
             effectiveKernelId,
-            python_path ? 10 : 1
+            pythonPath ? 10 : 1
           );
         } else {
           await vscode.commands.executeCommand("notebook.selectKernel", {
@@ -237,6 +291,11 @@ export function registerKernelTools(server: McpServer): void {
         return ErrorResult(
           `Error: ${err instanceof Error ? err.message : String(err)}`
         );
+      } finally {
+        // Registering may have switched the workspace's Python interpreter,
+        // which Pylance, terminals and debugging share. The notebook keeps the
+        // kernel it was just given; put everything else back.
+        interpreterRestored = (await registration?.restore()) ?? false;
       }
 
       let confirmed: any;
@@ -250,8 +309,10 @@ export function registerKernelTools(server: McpServer): void {
       const result = {
         notebookUri: notebook.uri.toString(),
         requested: effectiveKernelId ?? null,
-        pythonPath: python_path ?? null,
-        mode: effectiveKernelId ? "programmatic" : "picker",
+        pythonPath: pythonPath ?? null,
+        mode,
+        replacedRunningKernel: !!current,
+        workspaceInterpreterRestored: interpreterRestored,
         connected: !!confirmed,
         language: confirmed?.language ?? null,
         status: confirmed?.status ?? null
@@ -261,10 +322,15 @@ export function registerKernelTools(server: McpServer): void {
         return TextResult(JSON.stringify(result, null, 2));
       }
       const lines = [`# Kernel Selection`, ""];
-      if (effectiveKernelId) {
+      if (mode === "workspace-interpreter") {
+        lines.push(`Attached the workspace's Python interpreter: \`${pythonPath}\`.`);
+      } else if (effectiveKernelId) {
         lines.push(`Attempted to select **${effectiveKernelId}**.`);
       } else {
-        lines.push(`Opened the kernel picker for the user.`);
+        lines.push(`No workspace interpreter is selected, so the kernel picker was opened for the user.`);
+      }
+      if (current) {
+        lines.push("The previously running kernel was replaced; its variables are gone.");
       }
       lines.push(
         result.connected
@@ -312,6 +378,7 @@ export function registerKernelTools(server: McpServer): void {
           notebookEditor: { notebookUri: notebook.uri }
         });
         finalStatus = await restartDone;
+        forgetRuns(notebook);
       } catch (err) {
         return ErrorResult(
           `Error: ${err instanceof Error ? err.message : String(err)}`

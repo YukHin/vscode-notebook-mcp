@@ -4,29 +4,33 @@ A VS Code extension that exposes the Jupyter notebooks in your VSCode editor to 
 
 > Status: pre-alpha, single-developer project. Built fresh; not a fork.
 
-## Tools (15)
+## Tools (19)
 
 ### Discovery
 | Tool | Description |
 |---|---|
 | `notebook_list_open` | List all open notebooks with URI, file name, cell count, and which is active |
 | `notebook_open` | Open a `.ipynb` file (absolute path, `file://` URI, or workspace-relative) so its cells become available |
-| `notebook_list_cells` | List cells with index, kind, language, preview, execution state |
+| `notebook_list_cells` | List cells with stable id, index, kind, language, preview, execution state |
 | `notebook_get_cell_content` | Full source of a cell |
-| `notebook_get_cell_output` | Outputs of a cell (text, errors, images as base64) |
+| `notebook_get_cell_output` | Current outputs of a cell (text, errors, images), within an output budget |
 
 ### Cell manipulation
 | Tool | Description |
 |---|---|
 | `notebook_insert_cell` | Insert a code or markdown cell at any position; optionally execute |
-| `notebook_edit_cell` | Replace contents of an existing cell |
-| `notebook_delete_cell` | Delete a cell by index |
+| `notebook_replace_in_cell` | Replace one exact piece of text in a cell, leaving the rest untouched |
+| `notebook_apply_edits` | Several replace / whole-cell edits across cells, all-or-nothing |
+| `notebook_edit_cell` | Replace the whole contents of a cell |
+| `notebook_delete_cell` | Delete a cell |
 | `notebook_save` | Save the editor's in-memory notebook to its `.ipynb` |
 
 ### Execution
 | Tool | Description |
 |---|---|
-| `notebook_run_cell` | Execute an existing code cell and return outputs |
+| `notebook_run_cell` | Execute a code cell and return this run's outputs; long runs report `running` after `timeout_seconds` |
+| `notebook_wait_cell` | Wait for a running cell without starting it again |
+| `notebook_interrupt_kernel` | Stop running and queued cells, keeping kernel state |
 | `notebook_clear_cell_output` | Clear outputs of one cell |
 | `notebook_clear_all_outputs` | Clear outputs of every cell |
 
@@ -34,10 +38,10 @@ A VS Code extension that exposes the Jupyter notebooks in your VSCode editor to 
 | Tool | Description |
 |---|---|
 | `notebook_get_kernel_info` | Language, status, notebook URI |
-| `notebook_select_kernel` | Attach a kernel by `python_path` (interpreter path — no controller id or prior VS Code selection needed), or by `kernel_id`, or pop the picker (see [Kernel selection](#kernel-selection)) |
+| `notebook_select_kernel` | Make sure the notebook has a kernel. With no arguments it keeps the running kernel or attaches the workspace's selected Python interpreter; with `python_path` or `kernel_id` it attaches that one, but won't replace a running kernel unless `replace_running_kernel` is set (see [Kernel selection](#kernel-selection)) |
 | `notebook_restart_kernel` | Restart the kernel, clearing in-memory state but keeping cell outputs |
 
-All tools accept an optional `notebook_uri` (omitted → uses the active notebook editor) and `response_format` (`"markdown"` or `"json"`).
+All tools accept an optional `notebook_uri` (omitted → uses the active notebook editor) and `response_format` (`"markdown"` or `"json"`). Cell tools take `cell_id` (from `notebook_list_cells`; it survives inserts and deletes) or `index`. Tools that return outputs take `max_output_chars` (default 20,000; long text keeps its start and end) and `max_images` (default 4), and return one form per output (no HTML duplicate of a DataFrame, no ANSI color codes).
 
 ## Setup
 
@@ -168,7 +172,7 @@ Notes on what the tests cover:
 **Runtime (`dependencies`)**
 
 - **`@modelcontextprotocol/sdk`** — the MCP server itself. We use `McpServer` (one per session, see `src/mcp/server.ts`) and `StreamableHTTPServerTransport` to speak MCP over the embedded HTTP server. Tool registration in `src/mcp/tools/*.ts` is all SDK API.
-- **`plotly.js-dist-min`** — bundled into `dist/plotly.min.js` by the `copy:plotly` script and loaded inside the hidden `notebook-mcp.plotlyRenderer` webview. The webview converts Plotly figure JSON to PNG via `Plotly.newPlot` + `Plotly.toImage`. We can't run Plotly in the extension host (no DOM), and shipping the bundle locally avoids a runtime CDN fetch under the webview's strict CSP. Using `-dist-min` (the prebuilt minified bundle) instead of `plotly.js` keeps the VSIX smaller and avoids pulling in Plotly's full build toolchain.
+- **`plotly.js-dist-min`** — bundled into `dist/plotly.min.js` by the `copy:plotly` script and loaded inside the `notebook-mcp.plotlyRenderer` webview, which runs as a background editor tab. The webview converts Plotly figure JSON to PNG via `Plotly.newPlot` + `Plotly.toImage`. We can't run Plotly in the extension host (no DOM), and shipping the bundle locally avoids a runtime CDN fetch under the webview's strict CSP. Using `-dist-min` (the prebuilt minified bundle) instead of `plotly.js` keeps the VSIX smaller and avoids pulling in Plotly's full build toolchain.
 - **`zod`** — schema definitions in `src/schemas/index.ts` and per-tool input validation across `cells.ts` / `kernel.ts` / `notebooks.ts`. The MCP SDK accepts zod schemas directly when registering tools, so we get validation + JSON Schema generation for free.
 
 **Dev (`devDependencies`)**

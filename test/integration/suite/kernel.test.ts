@@ -12,16 +12,16 @@ import {
   copyFixtureToTmp,
   ensureJupyterActivated,
   selectVenvKernel,
-  startKernel
+  startKernel,
+  venvPython
 } from "./helpers";
 
 // A venv that nothing else in the suite registers with the Python extension.
 // Pointing notebook_select_kernel at it exercises the tool's own interpreter
 // registration — without this the Jupyter extension never creates a controller
 // for the env and the kernel can't attach.
-const UNREGISTERED_VENV_PYTHON = path.join(
-  REPO_ROOT,
-  "test/fixtures/python-unregistered/.venv/bin/python"
+const UNREGISTERED_VENV_PYTHON = venvPython(
+  path.join(REPO_ROOT, "test/fixtures/python-unregistered/.venv")
 );
 
 suite("kernel tools", () => {
@@ -121,6 +121,32 @@ suite("kernel tools", () => {
     });
     assert.strictEqual(restart.isError, true, restart.text);
     assert.match(restart.text, /no kernel connected/i);
+  });
+
+  test("notebook_select_kernel keeps a running kernel and won't replace it without permission", async () => {
+    const tmpPath = copyFixtureToTmp("with-cells.ipynb");
+    const open = await callTool(mcp.client, "notebook_open", {
+      path: tmpPath,
+      show: true,
+      response_format: "json"
+    });
+    const uri = JSON.parse(open.text).uri as string;
+    await selectVenvKernel(vscode.Uri.parse(uri));
+    await startKernel(vscode.Uri.parse(uri));
+
+    const keep = await callTool(mcp.client, "notebook_select_kernel", {
+      notebook_uri: uri,
+      response_format: "json"
+    });
+    assert.strictEqual(keep.isError, false, keep.text);
+    assert.strictEqual(JSON.parse(keep.text).mode, "kept");
+
+    const refuse = await callTool(mcp.client, "notebook_select_kernel", {
+      notebook_uri: uri,
+      python_path: UNREGISTERED_VENV_PYTHON
+    });
+    assert.strictEqual(refuse.isError, true);
+    assert.match(refuse.text, /replace_running_kernel/);
   });
 
   test("notebook_select_kernel registers an unknown interpreter by python_path", async () => {

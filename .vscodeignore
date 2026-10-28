@@ -1,4 +1,7 @@
 .vscode/**
+.vscode-test/**
+end-to-end-test/**
+*.vsix
 .claude/**
 src/**
 manual-test/**

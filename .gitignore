@@ -8,4 +8,5 @@ out/
 test/fixtures/python/.venv/
 test/fixtures/python-unregistered/.venv/
 end-to-end-test/.venv/
-end-to-end-test/test.ipynb
+end-to-end-test/*.ipynb
+end-to-end-test/insiders/

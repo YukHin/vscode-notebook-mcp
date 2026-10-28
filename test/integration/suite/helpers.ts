@@ -2,7 +2,10 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
-import { controllerIdForInterpreter } from "../../../src/utils/kernel.js";
+import {
+  controllerIdForInterpreter,
+  selectKernelById
+} from "../../../src/utils/kernel.js";
 import { registerInterpreter } from "../../../src/utils/pythonEnv.js";
 
 // __dirname after compile is out/test/integration/suite — go up four levels to repo root.
@@ -39,10 +42,14 @@ export function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-const VENV_PYTHON = path.join(
-  REPO_ROOT,
-  "test/fixtures/python/.venv/bin/python"
-);
+/** The interpreter inside a uv/venv environment directory, on any OS. */
+export function venvPython(venvDir: string): string {
+  return process.platform === "win32"
+    ? path.join(venvDir, "Scripts", "python.exe")
+    : path.join(venvDir, "bin", "python");
+}
+
+const VENV_PYTHON = venvPython(path.join(REPO_ROOT, "test/fixtures/python/.venv"));
 
 /**
  * Wait until the Jupyter extension reports a connected kernel for the notebook.
@@ -96,11 +103,11 @@ export async function selectVenvKernel(
 
   const id = controllerIdForInterpreter(pythonPath);
 
-  await vscode.commands.executeCommand("notebook.selectKernel", {
-    notebookEditor: { notebookUri },
-    id,
-    extension: "ms-toolsai.jupyter"
-  });
+  // Retry like notebook_select_kernel does: right after startup the Python
+  // extension may still be discovering interpreters, so the controller can
+  // appear a beat late and a single select silently binds nothing — then the
+  // next execution pops a kernel picker no one can answer.
+  await selectKernelById(notebookUri, id, 10);
 
   // Give the controller binding a moment to register before tests run cells.
   await sleep(250);
