@@ -11,6 +11,7 @@ import {
   selectKernelById
 } from "../../utils/kernel.js";
 import { registerInterpreter } from "../../utils/pythonEnv.js";
+import { READ_ONLY, EDITS, DESTRUCTIVE } from "./annotations.js";
 
 const TextResult = (text: string) =>
   ({ content: [{ type: "text" as const, text }] });
@@ -137,6 +138,7 @@ export function registerKernelTools(server: McpServer): void {
     "notebook_get_kernel_info",
     "Get the active notebook's kernel: language, status, and notebook URI.",
     KernelInfoInput,
+    READ_ONLY,
     async ({ notebook_uri, response_format }) => {
       const access = await resolveNotebook(notebook_uri);
       if (!access.allowed) return ErrorResult(`Error: ${access.error}`);
@@ -190,6 +192,7 @@ export function registerKernelTools(server: McpServer): void {
     "notebook_select_kernel",
     "Select a kernel for a notebook. With kernel_id or python_path, attempts to set it directly; without either, opens the VS Code kernel picker for the user.",
     SelectKernelInput,
+    EDITS,
     async ({ kernel_id, python_path, notebook_uri, response_format }) => {
       const access = await resolveNotebook(notebook_uri);
       if (!access.allowed) return ErrorResult(`Error: ${access.error}`);
@@ -276,6 +279,7 @@ export function registerKernelTools(server: McpServer): void {
     "notebook_restart_kernel",
     "Restart the active notebook's kernel, clearing all in-memory state (variables, imports) while leaving cell outputs untouched. The kernel must already be connected — use notebook_select_kernel first if not.",
     RestartKernelInput,
+    DESTRUCTIVE,
     async ({ notebook_uri, response_format }) => {
       const access = await resolveNotebook(notebook_uri);
       if (!access.allowed) return ErrorResult(`Error: ${access.error}`);

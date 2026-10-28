@@ -3,6 +3,7 @@ import * as vscode from "vscode";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ResponseFormatSchema } from "../../schemas/index.js";
+import { READ_ONLY, EDITS } from "./annotations.js";
 
 const OpenNotebookInput = {
   path: z
@@ -44,6 +45,7 @@ export function registerNotebookTools(server: McpServer): void {
     "notebook_list_open",
     "List all open notebooks with their URI, file name, cell count, and which one is currently active in the editor.",
     { response_format: ResponseFormatSchema },
+    READ_ONLY,
     async ({ response_format }) => {
       const activeUri = vscode.window.activeNotebookEditor?.notebook.uri.toString();
       const notebooks = vscode.workspace.notebookDocuments.map((nb) => ({
@@ -84,6 +86,7 @@ export function registerNotebookTools(server: McpServer): void {
     "notebook_open",
     "Open a .ipynb file in VS Code so its cells become available to the other notebook tools. Returns the resolved URI and cell count.",
     OpenNotebookInput,
+    EDITS,
     async ({ path: inputPath, show, response_format }) => {
       const resolved = resolveNotebookUri(inputPath);
       if (resolved instanceof vscode.Uri === false) {

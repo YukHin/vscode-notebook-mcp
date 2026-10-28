@@ -48,7 +48,7 @@ That yields a minimal nbformat 4.5 notebook with a single empty code cell — th
 
 ### Attaching a kernel — picker workaround
 
-`notebook_select_kernel` without `kernel_id`/`python_path` currently errors with `Cannot read properties of undefined (reading 'uri')` when the notebook isn't a focused editor. The stub `notebookEditor` payload we pass at `src/mcp/tools/kernel.ts` is rejected by VS Code's picker handler (the picker path dereferences something on the real `NotebookEditor` that our stub lacks); the programmatic branch takes a code path that doesn't trip the deref. So drive selection programmatically: **pass `python_path`** (the absolute path to the env's `bin/python`) and the tool computes the controller id for you — no hashing required. (The `kernel_id` parameter is still accepted for the rare case you already have a controller id.)
+`notebook_select_kernel` without `kernel_id`/`python_path` currently errors with `Cannot read properties of undefined (reading 'uri')` when the notebook isn't a focused editor. The stub `notebookEditor` payload we pass at `src/mcp/tools/kernel.ts` is rejected by VS Code's picker handler (the picker path dereferences something on the real `NotebookEditor` that our stub lacks); the programmatic branch takes a code path that doesn't trip the deref. So drive selection programmatically: **pass `python_path`** (the absolute path to the env's `bin/python`, or `Scripts\python.exe` on Windows — Windows paths are normalized differently, see `normalizeInterpreterPath`) and the tool computes the controller id for you — no hashing required. (The `kernel_id` parameter is still accepted for the rare case you already have a controller id.)
 
 The controller is bound eagerly but the kernel session is lazy — `notebook_get_kernel_info` reports "not connected" until a cell actually executes. Issue an `notebook_insert_cell` with `execute: true` first to force the attach.
 
@@ -94,6 +94,9 @@ Finish by re-running every code cell in index order so the saved notebook has fr
 - The server lives entirely inside the VS Code extension host process — it's not a separate binary. That's how it can call `vscode.*` APIs synchronously.
 - MCP clients connect via `http://127.0.0.1:<port>/mcp` using **StreamableHTTP** transport. There's also a `GET /health` endpoint.
 
+### Access control (`src/mcp/server.ts`)
+Every request must have `Host: 127.0.0.1:<port>` or `localhost:<port>` (DNS-rebinding protection) and no `Origin` header (browsers always send one; MCP clients don't). No CORS headers are sent. `/mcp` also requires `Authorization: Bearer <token>`; `/health` does not. The token is generated on first activation and stored in `context.secrets` (`notebook-mcp.token`). Each window writes `~/.vscode-notebook-mcp/<extension-host pid>.json` with `url`, `port`, `token` and `workspaceFolders` so local clients and scripts can connect; it is removed on deactivate, and files whose pid is no longer running are swept on the next start. Do not reintroduce CORS or unauthenticated routes that reach tools — any web page could otherwise execute code in the kernel.
+
 ### MCP transport — one McpServer per session
 `src/mcp/server.ts` keeps a `Map<sessionId, McpServer>` and a `Map<sessionId, StreamableHTTPServerTransport>`. On the first POST to `/mcp` without a session id, it mints a new UUID, builds a fresh `McpServer` via `createMcpServer()`, registers all tools on it, and connects it to a new transport. Subsequent requests carrying `mcp-session-id` route to the existing pair. `transport.onclose` cleans both maps.
 
@@ -102,8 +105,10 @@ This per-session construction is deliberate (commit `6c02e9a`) — sharing one `
 ### Tool registration
 All tools are registered through `registerAllTools(server)` in `src/mcp/tools/index.ts`, which fans out to:
 - `notebooks.ts` — `notebook_list_open`, `notebook_open`
-- `cells.ts` — list / get / insert / edit / delete / run / clear-output tools
+- `cells.ts` — list / get / insert / edit / delete / run / clear-output tools, `notebook_save`
 - `kernel.ts` — `notebook_get_kernel_info`, `notebook_select_kernel`, `notebook_restart_kernel`
+
+Each tool passes one of the annotation presets from `tools/annotations.ts` (`READ_ONLY`, `EDITS`, `DESTRUCTIVE`, `RUNS_CODE`) so clients can tell reads from edits and code execution. The server also sends MCP `instructions` (top of `server.ts`) telling agents to use these tools, not file tools, for open notebooks and to call `notebook_save` when done, because edits live in the editor until saved.
 
 Every tool accepts an optional `notebook_uri` (omit → active notebook editor) and `response_format: "markdown" | "json"` (default `"markdown"`). Schemas live in `src/schemas/index.ts` (zod). Keep adding tools by following these conventions:
 - Use `NotebookUriSchema`, `CellIndexSchema`, `ResponseFormatSchema` from `schemas/index.ts`.
@@ -112,9 +117,9 @@ Every tool accepts an optional `notebook_uri` (omit → active notebook editor) 
 
 ### Three non-obvious mechanics
 
-**Cell tracking across edits (`src/utils/notebook.ts`).** When `notebook_insert_cell` inserts a cell and `execute: true`, concurrent edits could shift its index before execution finishes. To survive that, every inserted cell gets a random `metadata.id` (`generateCellId`), and `waitForCellExecution` polls by **id**, not index. `notebook_run_cell` uses `waitForCellExecutionByIndex` because the user is targeting a stable, pre-existing index.
+**Cell tracking across edits (`src/utils/notebook.ts`).** Concurrent edits can shift a cell's index while it runs. `runCellAndWait` therefore tracks the `NotebookCell` **object**, which survives inserts/deletes around it (its `index` updates, and is `-1` once the cell itself is deleted). Inserted cells still get a `metadata.id` (`generateCellId`) so `notebook_insert_cell` can find the cell it just inserted.
 
-**Execution completion detection.** VS Code creates `cell.executionSummary` (with `timing.startTime`) as soon as a run starts but only assigns `executionSummary.success` to a boolean once the kernel reports completion. The wait helpers poll for `typeof success === "boolean"` — do not switch to checking `timing.endTime` or relying on the command awaitable, both of which return before the kernel is done.
+**Execution completion detection.** VS Code creates `cell.executionSummary` (with `timing.startTime`) as soon as a run starts but only assigns `executionSummary.success` to a boolean once the kernel reports completion. `runCellAndWait` waits for `typeof success === "boolean"` **and** a summary that differs from the snapshot taken before the run (execution order or start time) — a cell that ran before already has a boolean `success`, and `notebook.cell.execute` can return before the new run starts, so checking `success` alone returns the previous run's outputs. Do not switch to checking `timing.endTime` or relying on the command awaitable, both of which return before the kernel is done. It listens to `onDidChangeNotebookDocument`, with a 1 s poll as a fallback.
 
 **Plotly rendering via a hidden WebviewView (`src/utils/plotly.ts`).** Plotly outputs (`application/vnd.plotly.v1+json`) are not images out of the box — Jupyter ships JSON figure specs. We can't run `plotly.js` in the extension host (no DOM), so the extension contributes a `webviewView` (id `notebook-mcp.plotlyRenderer`) to a panel container. `parseOutputs` posts each figure to that webview, which calls `Plotly.newPlot` + `Plotly.toImage` and posts back a PNG data URL. The webview is set up with `retainContextWhenHidden: true` and the panel is auto-closed after the first resolve, so the renderer stays warm but invisible. Plotly is bundled at build time by `npm run copy:plotly` (which copies `plotly.min.js` into `dist/`) so the webview can load it as a local resource under the strict CSP.
 
@@ -132,5 +137,5 @@ Every tool accepts an optional `notebook_uri` (omit → active notebook editor) 
 ## Config surface
 
 - `notebook-mcp.port` (number, default 49777) — preferred port; auto-bumps if busy.
-- Two commands: `notebook-mcp.restartServer`, `notebook-mcp.showInfo` (status bar click target).
+- Commands: `notebook-mcp.restartServer`, `notebook-mcp.showInfo` (status bar click target), `notebook-mcp.copyClaudeCommand` (copies a `claude mcp add … --header "Authorization: Bearer …"` line), `notebook-mcp.regenerateToken`.
 - One webview view: `notebook-mcp.plotlyRenderer` in a `notebook-mcp-utility` panel container — internal, used only for Plotly rendering.

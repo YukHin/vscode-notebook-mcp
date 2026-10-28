@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-10-28
+
+### Security
+
+- The MCP endpoint now requires a bearer token. It is generated on first run, kept in VS Code's SecretStorage, and can be copied as a ready-to-run `claude mcp add` command (`Notebook MCP: Copy Claude Code Command`) or rotated (`Notebook MCP: Regenerate Access Token`).
+- Requests are refused unless the `Host` header is `127.0.0.1:<port>` or `localhost:<port>` (DNS-rebinding protection) and refused if they carry an `Origin` header. CORS headers are no longer sent. Previously any web page open in a browser could drive the server and execute code in the kernel.
+
+### Added
+
+- `notebook_save` — write the editor's in-memory notebook to its `.ipynb`.
+- MCP `instructions` telling agents to use these tools, not file tools, for notebooks open in VS Code, and to save when done.
+- Tool annotations (`readOnlyHint` / `destructiveHint` / `openWorldHint`) so clients can tell reads from edits and code execution.
+- A discovery file per window at `~/.vscode-notebook-mcp/<pid>.json` with the URL, port, token and workspace folders; stale files from crashed windows are removed.
+
+### Fixed
+
+- Re-running a cell that had run before could return the previous run's outputs, because completion was detected by `executionSummary.success` alone. The tools now wait for a summary that differs from the one before the run.
+- `notebook_run_cell` tracked the cell by index while waiting, so inserting or deleting cells meanwhile could return another cell's outputs or fail out of range. Cells are now tracked by object, and a cell deleted mid-run is reported as such.
+- `notebook_select_kernel` with `python_path` computed the wrong controller id on Windows. Windows paths are now normalized the way the Jupyter extension does it (hash of the Uri path, fsPath in the id).
+- Waiting for execution listens to notebook change events instead of polling every 100 ms.
+- The server reports the real extension version instead of `0.1.0`.
+
 ## [0.3.0] - 2026-05-31
 
 ### Added

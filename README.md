@@ -4,7 +4,7 @@ A VS Code extension that exposes the Jupyter notebooks in your VSCode editor to 
 
 > Status: pre-alpha, single-developer project. Built fresh; not a fork.
 
-## Tools (13)
+## Tools (15)
 
 ### Discovery
 | Tool | Description |
@@ -21,6 +21,7 @@ A VS Code extension that exposes the Jupyter notebooks in your VSCode editor to 
 | `notebook_insert_cell` | Insert a code or markdown cell at any position; optionally execute |
 | `notebook_edit_cell` | Replace contents of an existing cell |
 | `notebook_delete_cell` | Delete a cell by index |
+| `notebook_save` | Save the editor's in-memory notebook to its `.ipynb` |
 
 ### Execution
 | Tool | Description |
@@ -34,6 +35,7 @@ A VS Code extension that exposes the Jupyter notebooks in your VSCode editor to 
 |---|---|
 | `notebook_get_kernel_info` | Language, status, notebook URI |
 | `notebook_select_kernel` | Attach a kernel by `python_path` (interpreter path — no controller id or prior VS Code selection needed), or by `kernel_id`, or pop the picker (see [Kernel selection](#kernel-selection)) |
+| `notebook_restart_kernel` | Restart the kernel, clearing in-memory state but keeping cell outputs |
 
 All tools accept an optional `notebook_uri` (omitted → uses the active notebook editor) and `response_format` (`"markdown"` or `"json"`).
 
@@ -46,17 +48,16 @@ All tools accept an optional `notebook_uri` (omitted → uses the active noteboo
    npm run build
    ```
    Then open this folder in VS Code and press **F5** to launch an Extension Development Host with the extension loaded.
-3. Add to your MCP client config:
-   ```json
-   {
-     "mcpServers": {
-       "notebook": {
-         "url": "http://127.0.0.1:49777/mcp"
-       }
-     }
-   }
+3. Connect your MCP client. The server requires a bearer token, generated on first run. For Claude Code, run **Notebook MCP: Copy Claude Code Command** from the command palette and paste the copied line into a terminal; it looks like:
+   ```bash
+   claude mcp add --transport http --scope user notebook http://127.0.0.1:49777/mcp --header "Authorization: Bearer <token>"
    ```
+   For other clients, the URL and token are also in `~/.vscode-notebook-mcp/<pid>.json` (one file per VS Code window). To keep the token out of a checked-in `.mcp.json`, reference an environment variable: `"headers": { "Authorization": "Bearer ${NOTEBOOK_MCP_TOKEN}" }`.
 4. Open a `.ipynb` file in the Extension Development Host. Look for the `🪐 :49777` indicator in the status bar.
+
+### Security
+
+The server listens on `127.0.0.1` only, rejects requests whose `Host` isn't `127.0.0.1`/`localhost` on its port (DNS rebinding), rejects any request with an `Origin` header (web pages), sends no CORS headers, and requires the bearer token on `/mcp`. If the token leaks, run **Notebook MCP: Regenerate Access Token**.
 
 ### Configuration
 

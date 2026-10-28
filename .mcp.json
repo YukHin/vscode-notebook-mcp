@@ -2,7 +2,10 @@
   "mcpServers": {
     "notebook-mcp": {
       "type": "http",
-      "url": "http://127.0.0.1:49777/mcp"
+      "url": "http://127.0.0.1:49777/mcp",
+      "headers": {
+        "Authorization": "Bearer ${NOTEBOOK_MCP_TOKEN}"
+      }
     }
   }
 }

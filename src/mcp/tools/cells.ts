@@ -17,9 +17,10 @@ import {
   deleteCells,
   editCellContent,
   generateCellId,
-  waitForCellExecution,
-  waitForCellExecutionByIndex
+  runCellAndWait,
+  saveNotebook
 } from "../../utils/notebook.js";
+import { READ_ONLY, EDITS, DESTRUCTIVE, RUNS_CODE } from "./annotations.js";
 
 type ContentBlock =
   | { type: "text"; text: string }
@@ -39,11 +40,6 @@ function ResultWithImages(text: string, outputs: CellOutput[]) {
     }
   }
   return { content };
-}
-
-function isCellExecuting(cell: vscode.NotebookCell): boolean {
-  const timing = cell.executionSummary?.timing;
-  return !!timing && timing.startTime !== undefined && timing.endTime === undefined;
 }
 
 const ListCellsInput = {
@@ -95,6 +91,7 @@ export function registerCellTools(server: McpServer): void {
     "notebook_list_cells",
     "List cells in a notebook with index, kind, language, line count, content preview, and execution state.",
     ListCellsInput,
+    READ_ONLY,
     async ({ notebook_uri, response_format }) => {
       const access = await resolveNotebook(notebook_uri);
       if (!access.allowed) return ErrorResult(`Error: ${access.error}`);
@@ -134,6 +131,7 @@ export function registerCellTools(server: McpServer): void {
     "notebook_get_cell_content",
     "Get the full source of a cell.",
     CellTargetInput,
+    READ_ONLY,
     async ({ index, notebook_uri, response_format }) => {
       const access = await resolveNotebook(notebook_uri);
       if (!access.allowed) return ErrorResult(`Error: ${access.error}`);
@@ -171,6 +169,7 @@ export function registerCellTools(server: McpServer): void {
     "notebook_get_cell_output",
     "Get the outputs of a cell (text, errors, images as base64).",
     CellTargetInput,
+    READ_ONLY,
     async ({ index, notebook_uri, response_format }) => {
       const access = await resolveNotebook(notebook_uri);
       if (!access.allowed) return ErrorResult(`Error: ${access.error}`);
@@ -210,8 +209,9 @@ export function registerCellTools(server: McpServer): void {
 
   server.tool(
     "notebook_insert_cell",
-    "Insert a new cell (code or markdown). Optionally execute it immediately.",
+    "Insert a new cell (code or markdown). Optionally execute it immediately in the notebook's kernel.",
     InsertCellInput,
+    RUNS_CODE,
     async ({ content, type, index, language, execute, notebook_uri, response_format }) => {
       const access = await resolveNotebook(notebook_uri);
       if (!access.allowed) return ErrorResult(`Error: ${access.error}`);
@@ -254,11 +254,7 @@ export function registerCellTools(server: McpServer): void {
 
       if (execute && type === "code") {
         try {
-          await vscode.commands.executeCommand("notebook.cell.execute", {
-            ranges: [{ start: cellIndex, end: cellIndex + 1 }],
-            document: notebook.uri
-          });
-          const executed = await waitForCellExecution(notebook, cellId);
+          const executed = await runCellAndWait(notebook, inserted);
           execution = {
             success: executed.executionSummary?.success ?? false,
             executionOrder: executed.executionSummary?.executionOrder ?? null,
@@ -314,8 +310,9 @@ export function registerCellTools(server: McpServer): void {
 
   server.tool(
     "notebook_edit_cell",
-    "Replace the contents of an existing cell.",
+    "Replace the contents of an existing cell. The change stays in the editor (undoable) until notebook_save.",
     EditCellInput,
+    EDITS,
     async ({ index, content, notebook_uri, response_format }) => {
       const access = await resolveNotebook(notebook_uri);
       if (!access.allowed) return ErrorResult(`Error: ${access.error}`);
@@ -340,6 +337,7 @@ export function registerCellTools(server: McpServer): void {
     "notebook_delete_cell",
     "Delete a cell by index.",
     CellTargetInput,
+    DESTRUCTIVE,
     async ({ index, notebook_uri, response_format }) => {
       const access = await resolveNotebook(notebook_uri);
       if (!access.allowed) return ErrorResult(`Error: ${access.error}`);
@@ -370,8 +368,9 @@ export function registerCellTools(server: McpServer): void {
 
   server.tool(
     "notebook_run_cell",
-    "Execute an existing code cell by index and return its outputs. The cell and its output persist in the notebook.",
+    "Execute an existing code cell by index in the notebook's kernel and return the outputs of this run. If the cell is already running, waits for that run instead. The cell and its output persist in the notebook.",
     CellTargetInput,
+    RUNS_CODE,
     async ({ index, notebook_uri, response_format }) => {
       const access = await resolveNotebook(notebook_uri);
       if (!access.allowed) return ErrorResult(`Error: ${access.error}`);
@@ -399,13 +398,7 @@ export function registerCellTools(server: McpServer): void {
 
       let executed: vscode.NotebookCell;
       try {
-        if (!isCellExecuting(cell)) {
-          await vscode.commands.executeCommand("notebook.cell.execute", {
-            ranges: [{ start: index, end: index + 1 }],
-            document: notebook.uri
-          });
-        }
-        executed = await waitForCellExecutionByIndex(notebook, index);
+        executed = await runCellAndWait(notebook, cell);
       } catch (err) {
         return ErrorResult(
           `Error: ${err instanceof Error ? err.message : String(err)}`
@@ -415,7 +408,7 @@ export function registerCellTools(server: McpServer): void {
       const outputs = await parseOutputs(executed.outputs);
       const result = {
         success: executed.executionSummary?.success ?? false,
-        cellIndex: index,
+        cellIndex: executed.index,
         executionOrder: executed.executionSummary?.executionOrder ?? null,
         outputs
       };
@@ -424,7 +417,7 @@ export function registerCellTools(server: McpServer): void {
         return TextResult(JSON.stringify(result, null, 2));
       }
       const lines = [
-        `# Cell ${index} Execution Result`,
+        `# Cell ${result.cellIndex} Execution Result`,
         "",
         `**Status**: ${result.success ? "Success" : "Failed"}${result.executionOrder ? ` (execution #${result.executionOrder})` : ""}`,
         "",
@@ -439,6 +432,7 @@ export function registerCellTools(server: McpServer): void {
     "notebook_clear_cell_output",
     "Clear the outputs of a single cell.",
     CellTargetInput,
+    DESTRUCTIVE,
     async ({ index, notebook_uri, response_format }) => {
       const access = await resolveNotebook(notebook_uri);
       if (!access.allowed) return ErrorResult(`Error: ${access.error}`);
@@ -466,6 +460,7 @@ export function registerCellTools(server: McpServer): void {
     "notebook_clear_all_outputs",
     "Clear outputs from every cell in the notebook.",
     ClearAllInput,
+    DESTRUCTIVE,
     async ({ notebook_uri, response_format }) => {
       const access = await resolveNotebook(notebook_uri);
       if (!access.allowed) return ErrorResult(`Error: ${access.error}`);
@@ -488,6 +483,37 @@ export function registerCellTools(server: McpServer): void {
       }
       return TextResult(
         `Cleared outputs from all ${notebook.cellCount} cells`
+      );
+    }
+  );
+
+  server.tool(
+    "notebook_save",
+    "Save the notebook's in-editor state (sources and outputs) to its .ipynb file. Call this when a set of edits is done, or before anything reads the file from disk.",
+    ClearAllInput,
+    EDITS,
+    async ({ notebook_uri, response_format }) => {
+      const access = await resolveNotebook(notebook_uri);
+      if (!access.allowed) return ErrorResult(`Error: ${access.error}`);
+
+      const notebook = access.notebook!;
+      if (notebook.isUntitled) {
+        return ErrorResult(
+          "Error: this notebook has never been saved. Ask the user to save it once in VS Code to choose a file name."
+        );
+      }
+      const wasDirty = notebook.isDirty;
+      const saved = await saveNotebook(notebook);
+      if (!saved) {
+        return ErrorResult(`Error: VS Code could not save ${notebook.uri.fsPath}.`);
+      }
+
+      const result = { saved: true, hadUnsavedChanges: wasDirty, path: notebook.uri.fsPath };
+      if (response_format === "json") {
+        return TextResult(JSON.stringify(result, null, 2));
+      }
+      return TextResult(
+        wasDirty ? `Saved ${result.path}` : `No unsaved changes in ${result.path}`
       );
     }
   );

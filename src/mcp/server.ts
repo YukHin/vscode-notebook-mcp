@@ -11,34 +11,93 @@ export interface ServerHandle {
   stop: () => Promise<void>;
 }
 
-export async function startMCPServer(preferredPort: number): Promise<ServerHandle> {
+// Guidance sent to the agent at connect time (MCP `instructions`).
+const INSTRUCTIONS = [
+  "These tools operate on notebooks that are open in the user's VS Code window, through the live editor and its running kernel.",
+  "Edits stay in the editor's memory (undoable, kernel state preserved) until notebook_save is called; the .ipynb on disk may be stale.",
+  "For a notebook that is open here, use these tools for every read, edit and run. Do not also read or write the same .ipynb with file tools: that sees stale content and can overwrite the user's unsaved work.",
+  "Call notebook_save when a set of edits is finished, or when another tool needs the file on disk."
+].join(" ");
+
+/**
+ * Reject anything that is not a local, non-browser client holding the token.
+ *
+ * - Host must be 127.0.0.1/localhost on our port, which defeats DNS rebinding
+ *   (a rebound page still sends its own hostname).
+ * - Browsers always attach Origin to cross-origin fetches; MCP clients such as
+ *   Claude Code don't, so any Origin header is refused. No CORS headers are
+ *   ever sent, so preflights fail too.
+ * - The bearer token proves the caller read the discovery file or was given
+ *   the token by the user.
+ */
+function rejectUnauthorized(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  port: number,
+  token: string,
+  requireToken: boolean
+): boolean {
+  const host = (req.headers.host ?? "").toLowerCase();
+  if (host !== `127.0.0.1:${port}` && host !== `localhost:${port}`) {
+    res.writeHead(403, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Forbidden host" }));
+    return true;
+  }
+  if (req.headers.origin !== undefined) {
+    res.writeHead(403, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Browser requests are not allowed" }));
+    return true;
+  }
+  if (requireToken && !tokenMatches(req.headers.authorization, token)) {
+    res.writeHead(401, {
+      "Content-Type": "application/json",
+      "WWW-Authenticate": "Bearer"
+    });
+    res.end(
+      JSON.stringify({
+        error:
+          "Missing or invalid token. Run 'Notebook MCP: Copy Claude Code Command' in VS Code."
+      })
+    );
+    return true;
+  }
+  return false;
+}
+
+function tokenMatches(header: string | undefined, token: string): boolean {
+  const match = /^Bearer\s+(.+)$/i.exec(header ?? "");
+  if (!match) return false;
+  const given = Buffer.from(match[1].trim());
+  const expected = Buffer.from(token);
+  return given.length === expected.length && crypto.timingSafeEqual(given, expected);
+}
+
+export async function startMCPServer(
+  preferredPort: number,
+  token: string,
+  version: string
+): Promise<ServerHandle> {
   const port = await findFreePort(preferredPort, preferredPort + PORT_SCAN_RANGE);
 
   const transports = new Map<string, StreamableHTTPServerTransport>();
   const servers = new Map<string, McpServer>();
 
   const createMcpServer = (): McpServer => {
-    const mcp = new McpServer({
-      name: "vscode-notebook-mcp",
-      version: "0.1.0"
-    });
+    const mcp = new McpServer(
+      { name: "vscode-notebook-mcp", version },
+      { instructions: INSTRUCTIONS }
+    );
     registerAllTools(mcp);
     return mcp;
   };
 
   const httpServer = http.createServer(async (req, res) => {
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, mcp-session-id");
-    res.setHeader("Access-Control-Expose-Headers", "mcp-session-id");
-
-    if (req.method === "OPTIONS") {
-      res.writeHead(204);
-      res.end();
+    const isHealth = req.method === "GET" && req.url === "/health";
+    if (rejectUnauthorized(req, res, port, token, !isHealth)) {
       return;
     }
 
-    if (req.method === "GET" && req.url === "/health") {
+    if (isHealth) {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(
         JSON.stringify({ status: "ok", server: "vscode-notebook-mcp", port })

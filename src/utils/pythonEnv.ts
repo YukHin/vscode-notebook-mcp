@@ -69,9 +69,16 @@ async function waitForKnownInterpreter(
   pythonPath: string,
   timeoutMs: number
 ): Promise<void> {
+  // Compare as fsPaths, case-insensitively on Windows, so "C:\..." and the
+  // Python extension's "c:\..." count as the same interpreter.
+  const norm = (p: string) => {
+    const fsPath = vscode.Uri.file(p).fsPath;
+    return process.platform === "win32" ? fsPath.toLowerCase() : fsPath;
+  };
+  const wanted = norm(pythonPath);
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-    if (environments.known?.some((e) => e.path === pythonPath)) {
+    if (environments.known?.some((e) => norm(e.path) === wanted)) {
       return;
     }
     await sleep(200);

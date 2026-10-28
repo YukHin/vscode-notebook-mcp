@@ -1,3 +1,4 @@
+import * as crypto from "crypto";
 import * as vscode from "vscode";
 
 export interface NotebookAccessResult {
@@ -95,53 +96,104 @@ export async function editCellContent(
 }
 
 export function generateCellId(): string {
-  return Math.random().toString(36).substring(2, 15);
+  return crypto.randomUUID();
+}
+
+export function isCellExecuting(cell: vscode.NotebookCell): boolean {
+  const timing = cell.executionSummary?.timing;
+  return !!timing && timing.startTime !== undefined && timing.endTime === undefined;
 }
 
 /**
- * Wait for a cell's execution to finish. Polls executionSummary.success
- * because VS Code creates the summary as soon as execution starts but only
- * sets success to a boolean once the kernel reports completion.
+ * Execute a code cell and resolve once *this* run has finished.
+ *
+ * Completion is "executionSummary.success is a boolean" — VS Code creates the
+ * summary when a run starts but only sets success when the kernel reports
+ * back. On its own that check is wrong for a cell that already ran: the old
+ * summary's success is a boolean too, and `notebook.cell.execute` can return
+ * before the new run starts, so the previous outputs would come back as the
+ * result. We therefore snapshot the summary first and only accept a finished
+ * summary that differs from it (new execution order or start time).
+ *
+ * The cell is tracked by object, not index: NotebookCell objects survive
+ * inserts and deletes around them (their `index` updates, and becomes -1 if
+ * the cell itself is removed), so concurrent edits by the user can't make us
+ * read another cell's outputs.
+ *
+ * If the cell is already running, we don't start it again and wait for that
+ * run instead.
  */
-export async function waitForCellExecution(
+export function runCellAndWait(
   notebook: vscode.NotebookDocument,
-  cellId: string,
+  cell: vscode.NotebookCell,
   timeoutMs = 60_000
 ): Promise<vscode.NotebookCell> {
+  const alreadyRunning = isCellExecuting(cell);
+  const before = alreadyRunning
+    ? undefined
+    : {
+        order: cell.executionSummary?.executionOrder,
+        start: cell.executionSummary?.timing?.startTime
+      };
+
+  const isDone = () => {
+    const summary = cell.executionSummary;
+    if (typeof summary?.success !== "boolean") return false;
+    if (!before) return true;
+    return (
+      summary.executionOrder !== before.order ||
+      summary.timing?.startTime !== before.start
+    );
+  };
+
   return new Promise((resolve, reject) => {
-    const startTime = Date.now();
-    const interval = setInterval(() => {
-      const cell = notebook.getCells().find((c) => c.metadata?.id === cellId);
-      if (!cell) {
-        clearInterval(interval);
-        reject(new Error("Cell not found (was it deleted?)"));
-        return;
+    let settled = false;
+    const finish = (err?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearInterval(safetyPoll);
+      sub.dispose();
+      err ? reject(err) : resolve(cell);
+    };
+    const check = () => {
+      if (cell.index < 0) {
+        finish(new Error("Cell was deleted while it was running."));
+      } else if (isDone()) {
+        finish();
       }
-      if (typeof cell.executionSummary?.success === "boolean") {
-        clearInterval(interval);
-        resolve(cell);
-        return;
-      }
-      if (Date.now() - startTime > timeoutMs) {
-        clearInterval(interval);
-        reject(new Error(`Cell execution timed out after ${timeoutMs}ms`));
-      }
-    }, 100);
+    };
+
+    // Execution-state changes arrive as document change events; the slow
+    // poll is only a fallback in case an event is missed.
+    const sub = vscode.workspace.onDidChangeNotebookDocument((e) => {
+      if (e.notebook === notebook) check();
+    });
+    const safetyPoll = setInterval(check, 1_000);
+    const timer = setTimeout(
+      () => finish(new Error(`Cell execution timed out after ${timeoutMs}ms`)),
+      timeoutMs
+    );
+
+    if (alreadyRunning) {
+      check();
+      return;
+    }
+    Promise.resolve(
+      vscode.commands.executeCommand("notebook.cell.execute", {
+        ranges: [{ start: cell.index, end: cell.index + 1 }],
+        document: notebook.uri
+      })
+    ).then(check, (err) =>
+      finish(err instanceof Error ? err : new Error(String(err)))
+    );
   });
 }
 
-export async function waitForCellExecutionByIndex(
-  notebook: vscode.NotebookDocument,
-  index: number,
-  timeoutMs = 60_000
-): Promise<vscode.NotebookCell> {
-  const startTime = Date.now();
-  while (Date.now() - startTime < timeoutMs) {
-    const cell = notebook.cellAt(index);
-    if (typeof cell.executionSummary?.success === "boolean") {
-      return cell;
-    }
-    await new Promise((r) => setTimeout(r, 100));
-  }
-  throw new Error(`Cell execution timed out after ${timeoutMs}ms`);
+/** Save the notebook to disk if it has unsaved changes. */
+export async function saveNotebook(
+  notebook: vscode.NotebookDocument
+): Promise<boolean> {
+  if (!notebook.isDirty) return true;
+  return notebook.save();
 }
