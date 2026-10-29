@@ -2,7 +2,7 @@
   "name": "vscode-notebook-mcp",
   "displayName": "Notebook MCP for Claude Code & Codex",
   "description": "Let Claude Code, Codex and other non-Copilot AI agents work on Jupyter notebooks the way GitHub Copilot can: edit cells in the open editor and run them in the live kernel — no .ipynb rewrites, no save conflicts, no lost kernel state.",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "publisher": "yukhin",
   "author": {
     "name": "YukHin"
