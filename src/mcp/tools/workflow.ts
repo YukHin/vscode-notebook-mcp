@@ -390,7 +390,7 @@ export function registerWorkflowTools(server: McpServer): void {
         const message = err instanceof Error ? err.message : String(err);
         if (/access|revoked|denied|permission/i.test(message)) {
           return ErrorResult(
-            `Error: Notebook MCP doesn't have access to Jupyter kernels (${message}). The first time, VS Code asks "Do you want to grant Kernel access to the extension VS Code Notebook MCP?" — the user needs to choose Allow. To change an earlier Deny, run "Jupyter: Manage Access To Jupyter Kernels" in VS Code.`
+            `Error: Notebook MCP doesn't have access to Jupyter kernels (${message}). The first time, VS Code asks "Do you want to grant Kernel access to the extension Notebook MCP for Claude Code & Codex?" — the user needs to choose Allow. To change an earlier Deny, run "Jupyter: Manage Access To Jupyter Kernels" in VS Code.`
           );
         }
         return ErrorResult(`Error: inspection failed in the kernel: ${message}`);

@@ -1,6 +1,20 @@
+<img src="images/icon.png" width="96" alt="" align="right">
+
 # vscode-notebook-mcp
 
-A VS Code extension that exposes the Jupyter notebooks in your VSCode editor to MCP-compatible AI agents (e.g. Claude Code). The agent reads, edits, and runs cells against the same kernel VS Code is using.
+**Jupyter notebooks for AI agents other than GitHub Copilot.** Copilot works on a notebook inside VS Code: it edits cells in the open editor and runs them in the kernel you're using. Agents outside VS Code — Claude Code, Codex, or any other MCP client — can't. They can only rewrite the `.ipynb` file on disk while the same notebook is open in VS Code, and that breaks in three ways:
+
+- **File conflicts you can't save past.** The editor and the file now disagree. VS Code reports that the file on disk is newer, and saving means choosing between throwing away your unsaved work and overwriting the agent's changes. Outputs and edits get lost either way.
+- **No access to the running kernel.** The agent can't run a cell in the kernel you're using or read its variables, so it re-runs whole notebooks from scratch or guesses.
+- **Lost context.** Nothing tells the agent which code the kernel actually ran, so it reasons about variables that no longer match the code on screen.
+
+This extension closes that gap. It exposes the notebooks open in VS Code to MCP-compatible agents, so they work the way Copilot does:
+
+- **Edit in the editor, not on disk — no file conflicts.** Changes go through VS Code's notebook API, into the document you have open: undoable, marked in the editor, other cells' outputs untouched, and saved by VS Code itself only when asked, so there is never a second version of the file to conflict with.
+- **Run in the live kernel.** Cells run in the kernel VS Code is already using, so variables survive between the agent's steps; long runs, interrupts and restarts are handled.
+- **Change only what's needed.** Replace one piece of a cell instead of rewriting it, address cells by stable ids, and get compact outputs instead of whole HTML tables.
+- **Keep the context straight.** The agent can see which cells were edited since they ran or never ran in this kernel, rerun just what's stale, and inspect variables without adding cells.
+- **Stay out of the way.** It keeps your kernel and Python interpreter choices, doesn't hide your terminal, and connects each Claude Code session to the right VS Code window.
 
 > **This is a fork.** It is based on [caryan/vscode-notebook-mcp](https://github.com/caryan/vscode-notebook-mcp) by Colm Ryan (MIT), forked at v0.3.0 (commit `9e8061a`). The original license and copyright are kept in [LICENSE](LICENSE).
 >
@@ -59,17 +73,25 @@ All tools accept an optional `notebook_uri` (omitted → uses the active noteboo
 - A Python environment with `ipykernel` for your notebooks (what Jupyter in VS Code needs anyway).
 - [Claude Code](https://claude.com/claude-code), or another MCP client.
 
-### Build and install the extension
+### Install from the Marketplace
 
-The extension isn't on the Marketplace; build a `.vsix` and install it:
+In VS Code, open the Extensions view, search for **Notebook MCP for Claude Code & Codex**, and install it. Or from a terminal:
 
 ```bash
-git clone <this repository>
+code --install-extension yukhin.vscode-notebook-mcp
+```
+
+### Or build from source
+
+```bash
+git clone https://github.com/YukHin/vscode-notebook-mcp.git
 cd vscode-notebook-mcp
 npm install
 npx @vscode/vsce package --no-dependencies
-code --install-extension vscode-notebook-mcp-0.6.0.vsix
+code --install-extension vscode-notebook-mcp-0.6.1.vsix
 ```
+
+The extension id is `yukhin.vscode-notebook-mcp`. If you installed an earlier build published as `colmryan.vscode-notebook-mcp`, uninstall it first: `code --uninstall-extension colmryan.vscode-notebook-mcp`.
 
 On Windows PowerShell, if scripts are disabled (`npm.ps1 cannot be loaded`), use `npm.cmd` and `npx.cmd` instead, or run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once.
 
@@ -110,7 +132,7 @@ Examples of what to ask:
 What you'll see in VS Code:
 
 - Cells Claude changed or inserted show **Changed by agent** / **Inserted by agent** in their cell status bar until you edit or run them. Undo with Ctrl+Z (Cmd+Z) in the notebook.
-- The first time Claude inspects variables, Jupyter asks *"Do you want to grant Kernel access to the extension VS Code Notebook MCP?"*. Choose **Allow** (once). To change it later, run **Jupyter: Manage Access To Jupyter Kernels**.
+- The first time Claude inspects variables, Jupyter asks *"Do you want to grant Kernel access to the extension Notebook MCP for Claude Code & Codex?"*. Choose **Allow** (once). To change it later, run **Jupyter: Manage Access To Jupyter Kernels**.
 - To approve every change before it's applied, turn on the setting `notebook-mcp.confirmEdits`: a diff opens and a notification asks **Apply** or **Reject** (no answer in 2 minutes rejects).
 - Edits stay in the editor until saved. Claude Code is told to use these tools, not its file tools, for open notebooks, and to call `notebook_save` when done.
 
@@ -123,7 +145,7 @@ The kernel is chosen the way you'd expect: if the notebook already has a running
 | `claude mcp get notebook` fails: "No VS Code window with Notebook MCP is open for …" | Open that folder (or a parent) in VS Code, or set `NOTEBOOK_MCP_WORKSPACE` to the folder of an open window. |
 | Claude Code doesn't list the notebook tools | Start a new Claude Code session; check `claude mcp list`. |
 | The status bar shows the notebook icon with `✗` | Click it for the error, then **Restart**. Another program may hold the ports 49777–49876; set `notebook-mcp.port`. |
-| `notebook_inspect_variables` says it has no kernel access | Run **Jupyter: Manage Access To Jupyter Kernels** and allow VS Code Notebook MCP. |
+| `notebook_inspect_variables` says it has no kernel access | Run **Jupyter: Manage Access To Jupyter Kernels** and allow Notebook MCP for Claude Code & Codex. |
 | An interrupt doesn't stop a cell on Windows | `time.sleep` and some C extensions can't be interrupted until they return. Wait (`notebook_wait_cell`) or restart the kernel. |
 | You think the token leaked | Run **Notebook MCP: Regenerate Access Token**. The bridge picks up the new one automatically. |
 
