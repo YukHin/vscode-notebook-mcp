@@ -310,4 +310,4 @@ The original author built the upstream project fresh, to learn and to have room 
 
 ## License
 
-MIT. Copyright (c) 2026 Colm Ryan for the original project; the fork's changes are released under the same license.
+MIT — see [LICENSE](LICENSE). Copyright (c) 2026 Colm Ryan for the original project and (c) 2026 YukHin for the fork's changes, both under the MIT license.
